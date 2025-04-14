@@ -18,7 +18,7 @@ PORT_LOCK = threading.Lock()
 logger = modbus_tk.utils.create_logger('console')
 
 class ntn_modbus_master():
-    def __init__(self, slaveAddress, port, baudrate=9600, bytesize=8, parity='N', stopbits=1, xonxoff=0):
+    def __init__(self, slaveAddress, port, baudrate=115200, bytesize=8, parity='N', stopbits=1, xonxoff=0):
         try:
             self.master = modbus_rtu.RtuMaster(serial.Serial(port = port, baudrate = baudrate, bytesize = bytesize, parity = parity, stopbits = stopbits, xonxoff = xonxoff))
             self.master.set_timeout(1)
@@ -106,11 +106,13 @@ def dl_read(ntn_dongle):
         try:
             data_len = 0
             PORT_LOCK.acquire()
+            # Check Downlink Data Size
             data_len = ntn_dongle.read_register(0xEC60)
             PORT_LOCK.release()
             if data_len != 0:
                 logger.info(f'Downlink data length: {data_len}')
                 PORT_LOCK.acquire()
+                # Read Downlink Data
                 dl_resp = ntn_dongle.read_registers(0xEC61, data_len)
                 PORT_LOCK.release()
                 logger.info(f'Downlink data response: {dl_resp}')
@@ -140,57 +142,56 @@ def main():
             logger.info(f'password: {passwd}')
             ntn_dongle.set_registers(0x0000, passwd)
 
+        # SN
         with PORT_LOCK:
             sn_resp = ntn_dongle.read_registers(0xEA60, 6)
-        logger.info(f'SN: {modbus_data_to_string(sn_resp)}')
-
+            logger.info(f'SN: {modbus_data_to_string(sn_resp)}')
+        # Model Name
         with PORT_LOCK:
             model_name_resp = ntn_dongle.read_registers(0xEA66, 5)
-        logger.info(f'Model Name: {modbus_data_to_string(model_name_resp)}')
-
+            logger.info(f'Model Name: {modbus_data_to_string(model_name_resp)}')
+        # FW version
         with PORT_LOCK:
             fw_ver_resp = ntn_dongle.read_registers(0xEA6B, 2)
-        logger.info(f'FW ver: {modbus_data_to_string(fw_ver_resp)}')
-        
+            logger.info(f'FW ver: {modbus_data_to_string(fw_ver_resp)}')
+        # HW version
         with PORT_LOCK:
             hw_ver_resp = ntn_dongle.read_registers(0xEA6D, 2)
-        logger.info(f'HW Ver: {modbus_data_to_string(hw_ver_resp)}')
-        
-        with PORT_LOCK:
-            imsi_resp = ntn_dongle.read_registers(0xEB00, 8)
-        logger.info(f'IMSI: {modbus_data_to_string(imsi_resp)}')
-
+            logger.info(f'HW Ver: {modbus_data_to_string(hw_ver_resp)}')
+        # Modbus ID
         with PORT_LOCK:
             modbus_id = ntn_dongle.read_register(0xEA6F)
-        logger.info(f'Modbud ID: {modbus_id}')
-
+            logger.info(f'Modbus ID: {modbus_id}')
+        # Heartbeat
         with PORT_LOCK:
             heartbeat = ntn_dongle.read_register(0xEA70)
-        logger.info(f'Heartbeat: {heartbeat}')
+            logger.info(f'Heartbeat: {heartbeat}')
 
+        # NTN IMSI
+        with PORT_LOCK:
+            imsi_resp = ntn_dongle.read_registers(0xEB00, 8)
+            logger.info(f'IMSI: {modbus_data_to_string(imsi_resp)}')
+        # SINR
         with PORT_LOCK:
             sinr = ntn_dongle.read_registers(0xEB13, 2)
-        logger.info(f'SINR: {modbus_data_to_string(sinr)}')
-
+            logger.info(f'SINR: {modbus_data_to_string(sinr)}')
+        # RSRP
         with PORT_LOCK:
             rsrp = ntn_dongle.read_registers(0xEB15, 2)
-        logger.info(f'RSRP: {modbus_data_to_string(rsrp)}')
-
+            logger.info(f'RSRP: {modbus_data_to_string(rsrp)}')
+        # Latitude
         with PORT_LOCK:
             lat = ntn_dongle.read_registers(0xEB1B, 5)
-        logger.info(f'Latitude: {modbus_data_to_string(lat)}')
-
+            logger.info(f'Latitude: {modbus_data_to_string(lat)}')
+        # Longtitude
         with PORT_LOCK:
             longi = ntn_dongle.read_registers(0xEB20, 5)
-        logger.info(f'Longitude: {modbus_data_to_string(longi)}')
-
-        with PORT_LOCK:
-            csq = ntn_dongle.read_registers(0xEB25, 3)
-        logger.info(f'csq classification: {modbus_data_to_string(csq)}')
+            logger.info(f'Longitude: {modbus_data_to_string(longi)}')
 
         """ check NTN dongle status """ 
         while True:
             with PORT_LOCK:
+                # NTN module status
                 ntn_status = ntn_dongle.read_register(0xEA71)
             if ntn_status:
                 module_at_ready = ntn_status & 0x01
@@ -210,21 +211,24 @@ def main():
         while True:    
             data_list = []
             with PORT_LOCK:
+                # RSRP
                 rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
-
-            logger.info(rsrp_resp)
-            rsrp = modbus_data_to_string(rsrp_resp)
-            if rsrp:
-                logger.info(f'RSRP: {rsrp}')
-                data_list.append(int(rsrp))
+            if rsrp_resp:
+                logger.info(rsrp_resp)
+                rsrp = modbus_data_to_string(rsrp_resp)
+                if rsrp:
+                    logger.info(f'RSRP: {rsrp}')
+                    data_list.append(int(rsrp))
 
             with PORT_LOCK:
+                # SINR
                 sinr_resp = ntn_dongle.read_registers(0xEB13, 2)
-            logger.info(sinr_resp)
-            sinr = modbus_data_to_string(sinr_resp)
-            if sinr:
-                logger.info(f'SINR: {sinr}')
-                data_list.append(int(sinr))
+                logger.info(sinr_resp)
+            if sinr_resp:
+                sinr = modbus_data_to_string(sinr_resp)
+                if sinr:
+                    logger.info(f'SINR: {sinr}')
+                    data_list.append(int(sinr))
 
             if data_list:
                 data = {'c':data_list}
@@ -242,21 +246,24 @@ def main():
                 logger.info(f'modbus data: {modbus_data}')
 
                 with PORT_LOCK:
+                    # Data send
                     response = ntn_dongle.set_registers(0xC550, modbus_data)
                 logger.info(f'response: {response}')
-
                 if response:
                     while True:
                         with PORT_LOCK:
+                            # check response length
                             data_len = ntn_dongle.read_register(0xF060)
                         if data_len != 0:
                             logger.info(f'reply data len: {data_len}')
                             """ read uplink response """
                             with PORT_LOCK:
+                                # read response data
                                 data_resp = ntn_dongle.read_registers(0xF061, data_len)
-                            logger.info(f'responsed data: {data_resp}')
-                            uplink_resp = modbus_data_to_string(data_resp)
-                            logger.info(f'Uplink response: {uplink_resp}')
+                                logger.info(f'responsed data: {data_resp}')
+                            if data_resp:
+                                uplink_resp = modbus_data_to_string(data_resp)
+                                logger.info(f'Uplink response: {uplink_resp}')
                             break
                         else:
                             sleep(1)
