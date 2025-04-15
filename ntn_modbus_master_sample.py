@@ -43,6 +43,8 @@ class ntn_modbus_master():
     def read_register(self, reg, functioncode=cst.READ_INPUT_REGISTERS):
         try:
             value=self.master.execute(self.slaveAddr, functioncode, reg, 1)
+            if value[0] == 0:
+                return None
             return value[0]
         except Exception as e:
             logger.info(e)
@@ -52,6 +54,8 @@ class ntn_modbus_master():
         try:
             #value = []
             values = self.master.execute(self.slaveAddr, functioncode, reg, num)
+            if all(x == 0 for x in values):
+                return None
             #print(type(values))
             #value = list(values)
             return values
@@ -156,26 +160,32 @@ def main():
         # SN
         with PORT_LOCK:
             sn_resp = ntn_dongle.read_registers(0xEA60, 6)
+        if sn_resp:
             logger.info(f'SN: {modbus_data_to_string(sn_resp)}')
         # Model Name
         with PORT_LOCK:
             model_name_resp = ntn_dongle.read_registers(0xEA66, 5)
+        if model_name_resp:
             logger.info(f'Model Name: {modbus_data_to_string(model_name_resp)}')
         # FW version
         with PORT_LOCK:
             fw_ver_resp = ntn_dongle.read_registers(0xEA6B, 2)
+        if fw_ver_resp:
             logger.info(f'FW ver: {modbus_data_to_string(fw_ver_resp)}')
         # HW version
         with PORT_LOCK:
             hw_ver_resp = ntn_dongle.read_registers(0xEA6D, 2)
+        if hw_ver_resp:
             logger.info(f'HW Ver: {modbus_data_to_string(hw_ver_resp)}')
         # Modbus ID
         with PORT_LOCK:
             modbus_id = ntn_dongle.read_register(0xEA6F)
+        if modbus_id:
             logger.info(f'Modbus ID: {modbus_id}')
         # Heartbeat
         with PORT_LOCK:
             heartbeat = ntn_dongle.read_register(0xEA70)
+        if heartbeat:
             logger.info(f'Heartbeat: {heartbeat}')
 
         # NTN IMSI
@@ -185,18 +195,22 @@ def main():
         # SINR
         with PORT_LOCK:
             sinr = ntn_dongle.read_registers(0xEB13, 2)
+        if sinr:
             logger.info(f'SINR: {modbus_data_to_string(sinr)}')
         # RSRP
         with PORT_LOCK:
             rsrp = ntn_dongle.read_registers(0xEB15, 2)
+        if rsrp:
             logger.info(f'RSRP: {modbus_data_to_string(rsrp)}')
         # Latitude
         with PORT_LOCK:
             lat = ntn_dongle.read_registers(0xEB1B, 5)
+        if lat:
             logger.info(f'Latitude: {modbus_data_to_string(lat)}')
         # Longtitude
         with PORT_LOCK:
             longi = ntn_dongle.read_registers(0xEB20, 5)
+        if longi:
             logger.info(f'Longitude: {modbus_data_to_string(longi)}')
 
         """ check NTN dongle status """ 
