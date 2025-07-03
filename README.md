@@ -37,6 +37,7 @@ python ntn_modbus_master_sample.py [--port <serial_port>] [--upload] [--dl]
 ```
 
 ### Arguments
+- `--type`: Protocol to use on NTN service (default: `NIDD`).
 - `--port`: Serial port of the device (default: `/dev/ttyUSB0`).
 - `--upload`: Enable periodic uplink data transmission (optional).
 - `--dl`: Enable continuous downlink data reading in a separate thread (optional).
