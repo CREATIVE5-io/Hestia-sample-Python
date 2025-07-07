@@ -26,7 +26,7 @@ This Python script is designed to test and interact with an NTN Modbus Master de
    ```
 2. Install dependencies:
    ```bash
-   pip install modbus_tk pyserial
+   pip install -r requirements.txt
    ```
 
 ## Usage
