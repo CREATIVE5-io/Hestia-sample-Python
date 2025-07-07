@@ -15,6 +15,7 @@ from time import sleep
 from time import time
 
 def parse_arguments():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST")
     parser.add_argument("--type", type=str, help="Specify NIDD or UDP", default='NIDD')
     parser.add_argument("--port", type=str, help="Specify port", default='/dev/ttyUSB0')
@@ -22,16 +23,12 @@ def parse_arguments():
     parser.add_argument("--dl", action='store_true', help="Enable downlink test", default=False)
     return parser.parse_args()
 
-g_args = parse_arguments()
-
-""" Cretet theading lock to control modbus port access """
+# === Globals ===
 PORT_LOCK = threading.Lock()
-
 logger = modbus_tk.utils.create_logger('console')
 
-logger.info(f'WARNING *** You set to run NTN dongle on "{g_args.type}" mode ***')
-
-class ntn_modbus_master():
+class ntn_modbus_master:
+    """Modbus RTU master for NTN dongle communication."""
     def __init__(self, slaveAddress, port, baudrate=115200, bytesize=8, parity='N', stopbits=1, xonxoff=0):
         try:
             self.master = modbus_rtu.RtuMaster(serial.Serial(port = port, baudrate = baudrate, bytesize = bytesize, parity = parity, stopbits = stopbits, xonxoff = xonxoff))
@@ -103,14 +100,12 @@ class ntn_modbus_master():
         return ntn_modbus_master._bytes_to_integers(chunks)
 
 def dl_read(ntn_dongle):
+    """Continuously read downlink data from the device."""
     while True:
         try:
-            data_len = 0
-            # Check Downlink Data Size
             data_len = ntn_dongle.read_register(0xEC60)
             if data_len != 0:
                 logger.info(f'Downlink data length: {data_len}')
-                # Read Downlink Data
                 dl_resp = ntn_dongle.read_registers(0xEC61, data_len)
                 logger.info(f'Downlink data response: {dl_resp}')
                 dl_data = b''.join(struct.pack('>H', v) for v in dl_resp)
@@ -123,164 +118,127 @@ def dl_read(ntn_dongle):
             logger.error(f"Error in downlink_modbus: {e}")
             sleep(1)
 
+def setup_ntn_device(ntn_dongle):
+    """Set up the NTN dongle: password, info, and log device details."""
+    DEFAULT_PASSWD = '00000000'
+    passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
+    logger.info(f'password: {passwd}')
+    valid_passwd = ntn_dongle.set_registers(0x0000, passwd)
+    if not valid_passwd:
+        logger.error(f'Password set failed')
+        sys.exit(1)
+    logger.info(f'Password set successfully')
+
+    def log_reg(desc, resp):
+        if resp:
+            logger.info(f'{desc}: {ntn_modbus_master.modbus_data_to_string(resp)}')
+
+    log_reg('SN', ntn_dongle.read_registers(0xEA60, 6))
+    log_reg('Model Name', ntn_dongle.read_registers(0xEA66, 5))
+    log_reg('FW ver', ntn_dongle.read_registers(0xEA6B, 2))
+    log_reg('HW Ver', ntn_dongle.read_registers(0xEA6D, 2))
+    modbus_id = ntn_dongle.read_register(0xEA6F)
+    if modbus_id:
+        logger.info(f'Modbus ID: {modbus_id}')
+    heartbeat = ntn_dongle.read_register(0xEA70)
+    if heartbeat:
+        logger.info(f'Heartbeat: {heartbeat}')
+    log_reg('IMSI', ntn_dongle.read_registers(0xEB00, 8))
+    log_reg('SINR', ntn_dongle.read_registers(0xEB13, 2))
+    log_reg('RSRP', ntn_dongle.read_registers(0xEB15, 2))
+    log_reg('Latitude', ntn_dongle.read_registers(0xEB1B, 5))
+    log_reg('Longitude', ntn_dongle.read_registers(0xEB20, 6))
+
+def ntn_status_loop(ntn_dongle, args):
+    """Main status loop: monitor status and handle upload if enabled."""
+    while True:
+        net_status = False
+        ntn_status = ntn_dongle.read_register(0xEA71)
+        if ntn_status:
+            if args.type == 'NIDD':
+                module_at_ready = ntn_status & 0x01
+                downlink_ready = (ntn_status & 0x02) >> 1
+                sim_ready = (ntn_status & 0x04) >> 2
+                network_registered = (ntn_status & 0x08) >> 3
+                logger.info('=== NTN dongle status ===')
+                logger.info(f'{module_at_ready=}')
+                logger.info(f'{downlink_ready=}')
+                logger.info(f'{sim_ready=}')
+                logger.info(f'{network_registered=}')
+                if ntn_status == 0xF:
+                    net_status = True
+            elif args.type == 'UDP':
+                module_at_ready = ntn_status & 0x01
+                ip_ready = (ntn_status & 0x02) >> 1
+                sim_ready = (ntn_status & 0x04) >> 2
+                network_registered = (ntn_status & 0x08) >> 3
+                socket_ready = (ntn_status & 0x10) >> 4
+                logger.info('=== NTN dongle status ===')
+                logger.info(f'{module_at_ready=}')
+                logger.info(f'{ip_ready=}')
+                logger.info(f'{sim_ready=}')
+                logger.info(f'{network_registered=}')
+                logger.info(f'{socket_ready=}')
+                if ntn_status == 0x1F:
+                    net_status = True
+            else:
+                logger.error(f'Wrong NTN type, input is :{args.type}')
+
+        if net_status:
+            if args.upload:
+                data_list = []
+                rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
+                if rsrp_resp:
+                    logger.info(f'rsrp_resp: {rsrp_resp}')
+                    rsrp = ntn_modbus_master.modbus_data_to_string(rsrp_resp)
+                    if rsrp:
+                        logger.info(f'RSRP: {repr(rsrp)}')
+                        data_list.append(int(rsrp))
+                sinr_resp = ntn_dongle.read_registers(0xEB13, 2)
+                if sinr_resp:
+                    sinr = ntn_modbus_master.modbus_data_to_string(sinr_resp)
+                    if sinr:
+                        logger.info(f'SINR: {sinr}')
+                        data_list.append(int(sinr))
+                if data_list:
+                    data = {'c': data_list}
+                    d_str = json.dumps(data)
+                    logger.info(f'd_str: {d_str}')
+                    d_bytes = d_str.encode('utf-8')
+                    logger.info(f'd_bytes: {d_bytes}')
+                    d_hex = binascii.hexlify(d_bytes)
+                    logger.info(f'packet: {d_hex}')
+                    modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
+                    modbus_data.extend([3338])
+                    logger.info(f'modbus data: {modbus_data}')
+                    response = ntn_dongle.set_registers(0xC550, modbus_data)
+                    logger.info(f'response: {response}')
+                    if response:
+                        while True:
+                            data_len = ntn_dongle.read_register(0xF060)
+                            if data_len != 0:
+                                logger.info(f'reply data len: {data_len}')
+                                data_resp = ntn_dongle.read_registers(0xF061, data_len)
+                                logger.info(f'responsed data: {data_resp}')
+                                if data_resp:
+                                    uplink_resp = ntn_modbus_master.modbus_data_to_string(data_resp)
+                                    logger.info(f'Uplink response: {uplink_resp}')
+                                break
+                            else:
+                                sleep(1)
+        sleep(10*60)
+
 def main():
+    args = parse_arguments()
+    logger.info(f'WARNING *** You set to run NTN dongle on "{args.type}" mode ***')
     NTN_DONGLE_ADDR = 1
     try:
-        ntn_dongle = ntn_modbus_master(NTN_DONGLE_ADDR, port = g_args.port, baudrate=115200)
-        if g_args.dl:
-            dl_thread = threading.Thread(target = dl_read, args = (ntn_dongle,))
+        ntn_dongle = ntn_modbus_master(NTN_DONGLE_ADDR, port=args.port, baudrate=115200)
+        if args.dl:
+            dl_thread = threading.Thread(target=dl_read, args=(ntn_dongle,))
             dl_thread.start()
-
-        DEFAULT_PASSWD = '00000000'
-        passwd = []
-        for i in range(0, len(DEFAULT_PASSWD), 2):
-            passwd.append(int(DEFAULT_PASSWD[i:i+2]))
-        logger.info(f'password: {passwd}')
-        valid_passwd = ntn_dongle.set_registers(0x0000, passwd)
-        if valid_passwd:
-            logger.info(f'Password set successfully')
-        else:
-            logger.error(f'Password set failed')
-            sys.exit(1)
-
-        # SN
-        sn_resp = ntn_dongle.read_registers(0xEA60, 6)
-        if sn_resp:
-            logger.info(f'SN: {ntn_modbus_master.modbus_data_to_string(sn_resp)}')
-        # Model Name
-        model_name_resp = ntn_dongle.read_registers(0xEA66, 5)
-        if model_name_resp:
-            logger.info(f'Model Name: {ntn_modbus_master.modbus_data_to_string(model_name_resp)}')
-        # FW version
-        fw_ver_resp = ntn_dongle.read_registers(0xEA6B, 2)
-        if fw_ver_resp:
-            logger.info(f'FW ver: {ntn_modbus_master.modbus_data_to_string(fw_ver_resp)}')
-        # HW version
-        hw_ver_resp = ntn_dongle.read_registers(0xEA6D, 2)
-        if hw_ver_resp:
-            logger.info(f'HW Ver: {ntn_modbus_master.modbus_data_to_string(hw_ver_resp)}')
-        # Modbus ID
-        modbus_id = ntn_dongle.read_register(0xEA6F)
-        if modbus_id:
-            logger.info(f'Modbus ID: {modbus_id}')
-        # Heartbeat
-        heartbeat = ntn_dongle.read_register(0xEA70)
-        if heartbeat:
-            logger.info(f'Heartbeat: {heartbeat}')
-        # NTN IMSI
-        imsi_resp = ntn_dongle.read_registers(0xEB00, 8)
-        if imsi_resp:
-            logger.info(f'IMSI: {ntn_modbus_master.modbus_data_to_string(imsi_resp)}')
-        # SINR
-        sinr = ntn_dongle.read_registers(0xEB13, 2)
-        if sinr:
-            logger.info(f'SINR: {ntn_modbus_master.modbus_data_to_string(sinr)}')
-        # RSRP
-        rsrp = ntn_dongle.read_registers(0xEB15, 2)
-        if rsrp:
-            logger.info(f'RSRP: {ntn_modbus_master.modbus_data_to_string(rsrp)}')
-        # Latitude
-        lat = ntn_dongle.read_registers(0xEB1B, 5)
-        if lat:
-            logger.info(f'Latitude: {ntn_modbus_master.modbus_data_to_string(lat)}')
-        # Longtitude
-        longi = ntn_dongle.read_registers(0xEB20, 6)
-        if longi:
-            logger.info(f'Longitude: {ntn_modbus_master.modbus_data_to_string(longi)}')
-
-        """ check NTN dongle status """ 
-        while True:
-            net_status = False
-            # NTN module status
-            ntn_status = ntn_dongle.read_register(0xEA71)
-            if ntn_status:
-                if g_args.type == 'NIDD':
-                    module_at_ready = ntn_status & 0x01
-                    downlink_ready = (ntn_status & 0x02) >> 1
-                    sim_ready = (ntn_status & 0x04) >> 2
-                    network_registered = (ntn_status & 0x08) >> 3
-
-                    logger.info('=== NTN dongle status ===')
-                    logger.info(f'{module_at_ready=}')
-                    logger.info(f'{downlink_ready=}')
-                    logger.info(f'{sim_ready=}')
-                    logger.info(f'{network_registered=}')
-                    if ntn_status == 0xF:
-                        net_status = True
-                elif g_args.type == 'UDP':
-                    module_at_ready = ntn_status & 0x01
-                    ip_ready = (ntn_status & 0x02) >> 1
-                    sim_ready = (ntn_status & 0x04) >> 2
-                    network_registered = (ntn_status & 0x08) >> 3
-                    socket_ready = (ntn_status & 0x10) >> 4
-
-                    logger.info('=== NTN dongle status ===')
-                    logger.info(f'{module_at_ready=}')
-                    logger.info(f'{ip_ready=}')
-                    logger.info(f'{sim_ready=}')
-                    logger.info(f'{network_registered=}')
-                    logger.info(f'{socket_ready=}')
-                    if ntn_status == 0x1F:
-                        net_status = True
-                else:
-                    logger.error(f'Wrong NTN type, input is :{g_args.type}')
-
-            if net_status:
-                if g_args.upload:
-                    data_list = []
-                    # RSRP
-                    rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
-                    if rsrp_resp:
-                        logger.info(f'rsrp_resp: {rsrp_resp}')
-                        rsrp = ntn_modbus_master.modbus_data_to_string(rsrp_resp)
-                        if rsrp:
-                            logger.info(f'RSRP: {repr(rsrp)}')
-                            data_list.append(int(rsrp))
-
-                    # SINR
-                    sinr_resp = ntn_dongle.read_registers(0xEB13, 2)
-                    if sinr_resp:
-                        sinr = ntn_modbus_master.modbus_data_to_string(sinr_resp)
-                        if sinr:
-                            logger.info(f'SINR: {sinr}')
-                            data_list.append(int(sinr))
-
-                    if data_list:
-                        data = {'c':data_list}
-
-                        d_str = json.dumps(data)
-                        logger.info(f'd_str: {d_str}')
-                        d_bytes = d_str.encode('utf-8')
-                        logger.info(f'd_bytes: {d_bytes}')
-                        d_hex  = binascii.hexlify(d_bytes)
-                        logger.info(f'packet: {d_hex}')
-
-                        modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
-                        """ add "\r\n" in the end of data """
-                        modbus_data.extend([3338])
-                        logger.info(f'modbus data: {modbus_data}')
-
-                        # Data send
-                        response = ntn_dongle.set_registers(0xC550, modbus_data)
-                        logger.info(f'response: {response}')
-                        if response:
-                            while True:
-                                # check response length
-                                data_len = ntn_dongle.read_register(0xF060)
-                                if data_len != 0:
-                                    logger.info(f'reply data len: {data_len}')
-                                    """ read uplink response """
-                                    # read response data
-                                    data_resp = ntn_dongle.read_registers(0xF061, data_len)
-                                    logger.info(f'responsed data: {data_resp}')
-                                    if data_resp:
-                                        uplink_resp = ntn_modbus_master.modbus_data_to_string(data_resp)
-                                        logger.info(f'Uplink response: {uplink_resp}')
-                                    break
-                                else:
-                                    sleep(1)
-            """ 10 minutes routine """
-            sleep(10*60)
+        setup_ntn_device(ntn_dongle)
+        ntn_status_loop(ntn_dongle, args)
     except Exception as e:
         logger.error(f'{e} - Code={e}')
         sys.exit(1)
