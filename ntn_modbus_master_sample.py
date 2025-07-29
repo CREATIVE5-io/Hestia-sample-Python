@@ -165,7 +165,7 @@ def ntn_status_loop(ntn_dongle, args):
                 logger.info(f'{downlink_ready=}')
                 logger.info(f'{sim_ready=}')
                 logger.info(f'{network_registered=}')
-                if ntn_status == 0xF:
+                if (ntn_status & 0xF) == 0xF:
                     net_status = True
             elif args.type == 'UDP':
                 module_at_ready = ntn_status & 0x01
@@ -179,12 +179,16 @@ def ntn_status_loop(ntn_dongle, args):
                 logger.info(f'{sim_ready=}')
                 logger.info(f'{network_registered=}')
                 logger.info(f'{socket_ready=}')
-                if ntn_status == 0x1F:
+                if (ntn_status & 0x1F) == 0x1F:
                     net_status = True
             else:
                 logger.error(f'Wrong NTN type, input is :{args.type}')
 
-        if net_status:
+        avbl = ntn_dongle.read_register(0xEA7D)
+        logger.info(f'{avbl=}')
+        upload_avbl = True if ntn_dongle.read_register(0xEA7D)==0 else False
+
+        if net_status and upload_avbl:
             if args.upload:
                 data_list = []
                 rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
