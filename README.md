@@ -14,64 +14,110 @@ This Python script is designed to test and interact with an NTN Modbus Master de
 ## Prerequisites
 - Python 3.6+
 - Required Python packages:
-  - `modbus_tk`
-  - `pyserial`
-- A compatible NTN Modbus Master device connected via a serial port (e.g., `/dev/ttyUSB0`).
+## Hestia-sample-Python
 
-## Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/CREATIVE5-io/Hestia-sample-Python.git
-   cd Hestia-sample-Python
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+Tools and small example scripts to interact with an NTN dongle (Modbus RTU) using a serial port.
 
-## Usage
-Run the script with optional command-line arguments:
+This repository contains two related scripts:
+
+- `ntn_modbus_master_sample.py` — the main sample script that initializes a Modbus RTU master, reads device info, monitors status, optionally starts a downlink reader thread, and can periodically upload telemetry.
+
+Both scripts use `modbus_tk` + `pyserial` to communicate with an NTN Modbus device.
+
+## Prerequisites
+
+- Python 3.6+
+- Install dependencies from `requirements.txt`:
+
+# Hestia-sample-Python
+
+Tools and small example scripts to interact with an NTN dongle (Modbus RTU) using a serial port.
+
+This repository contains two related scripts:
+
+- `ntn_modbus_master_sample.py` — the main sample script that initializes a Modbus RTU master, reads device info, monitors status, optionally starts a downlink reader thread, and can periodically upload telemetry.
+- `arg_test.py` — a smaller/testing script that exposes the same core functionality but is used for quick CLI-driven configuration and tests.
+
+Both scripts use `modbus_tk` + `pyserial` to communicate with an NTN Modbus device.
+
+## Prerequisites
+
+- Python 3.6+
+- Install dependencies from `requirements.txt`:
 
 ```bash
-python ntn_modbus_master_sample.py [--port <serial_port>] [--upload] [--dl]
+pip install -r requirements.txt
 ```
 
-### Arguments
-- `--type`: Protocol to use on NTN service (default: `NIDD`).
-- `--port`: Serial port of the device (default: `/dev/ttyUSB0`).
-- `--upload`: Enable periodic uplink data transmission (optional).
-- `--dl`: Enable continuous downlink data reading in a separate thread (optional).
+The current requirements file pins the primary dependencies:
 
-### Example
+```
+modbus_tk==1.1.5
+pyserial==3.5
+```
+
+## Quick start
+
+1. Connect your NTN dongle to the host (e.g. via USB-to-serial). Note the serial device path (for macOS/Linux commonly `/dev/ttyUSB0` or `/dev/tty.usbserial-*`).
+2. Run the main script:
+
+```bash
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0
+```
+
+Add `--dl` to enable continuous downlink monitoring (runs a reader thread) and `--upload` to enable periodic uplink telemetry reporting.
+
+## Command-line options
+
+Both scripts expose similar CLI arguments. The important flags are:
+
+- `--port`: Serial port device to open (default: `/dev/ttyUSB0`).
+- `--ntn_config`: When provided, the script will configure the NTN dongle using values supplied via `--remote_port`, `--apn`, `--ip`, and optional `--local_port`.
+- `--remote_port`: Remote port to set on the device (string).
+- `--apn`: APN string to configure on the device.
+- `--ip`: Remote IP address to set on the device.
+- `--local_port`: Optional local port (defaults to `55001` in code if omitted).
+- `--upload`: Enable periodic uplink (collects SINR/RSRP and sends over the device link).
+- `--dl`: Start a background thread that continuously polls for downlink data and logs it.
+
+Example: configure the device (requires the dongle to be connected):
+
+```bash
+python arg_test.py --ntn_config --remote_port 55001 --apn my.apn.example --ip 1.2.3.4 --local_port 55002 --port /dev/ttyUSB0
+```
+
+Example: start monitoring with both upload and downlink:
+
 ```bash
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --dl
 ```
 
-## Script Overview
-The script:
-1. Parses command-line arguments for port, uplink, and downlink options.
-2. Initializes a Modbus RTU master connection with the specified port and slave address (default: 1).
-3. Sets a default password (`00000000`) for device access.
-4. Reads and logs device information (Serial Number, Model Name, Firmware/Hardware Versions, Modbus ID, Heartbeat).
-5. Retrieves and logs NTN-specific data (IMSI, SINR, RSRP, GPS coordinates).
-6. Continuously checks NTN module status until fully ready (AT, SIM, network registered).
-7. If `--dl` is enabled, starts a thread to monitor and log downlink data.
-8. If `--upload` is enabled, periodically sends uplink data (SINR, RSRP) every 10 minutes and logs responses.
-9. Uses a threading lock to ensure thread-safe Modbus communication.
+## Behavior notes
+
+- Default Modbus slave address used by the code is `1` (NTN_DONGLE_ADDR = 1).
+- Serial parameters used when opening the port are 115200 baud, 8 data bits, no parity, 1 stop bit (8N1). Timeout is set via `self.master.set_timeout(1)` in code and can be adjusted in the source.
+- The `ntn_config` function writes the remote port, APN, IP, and local port into specific Modbus registers. It expects a live `ntn_modbus_master` instance (the device connection) as the first parameter.
+- After successful `--ntn_config` run, the sample script logs a success message and suggests unplugging/replugging the dongle to apply settings.
 
 ## Logging
-- Logs are output to the console with levels `INFO`, `DEBUG`, and `ERROR`.
-- Includes detailed information about Modbus transactions, data conversions, and errors.
+
+- The scripts use `modbus_tk`'s console logger. The logger outputs INFO/DEBUG/ERROR messages to the console for troubleshooting and verification of the operations.
 
 ## Troubleshooting
-- Ensure the serial port is correct and accessible.
-- Verify the device is powered on and configured with the correct Modbus ID (default: 1).
-- Check that dependencies (`modbus_tk`, `pyserial`) are installed.
-- If downlink or uplink operations fail, confirm the device is in a ready state (use status logs).
-- Increase the Modbus timeout (`self.master.set_timeout`) if communication errors occur.
+
+- Permission denied when opening `/dev/ttyUSB0`? Add your user to the appropriate group or use `sudo` (prefer configuring udev/permissions instead of running as root).
+- If Modbus reads/writes return `None` or empty values, check the device power, wiring, and Modbus ID. The code treats all-zero register responses as empty/invalid.
+- Install dependencies explicitly if needed: `pip install modbus_tk pyserial`.
+
+## Development notes & next steps
+
+- The CLI currently supports both a single multi-argument option (`--ntn_config` + separate flags) and a test mode in `arg_test.py`. For clearer automation you may prefer separate flags (`--remote-port`, `--apn`, etc.) — these are already present in the code.
+- Consider adding unit tests around data-conversion helpers such as `string_to_ascii_list` and `bytes_to_list_with_padding`.
 
 ## License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+MIT
 
 ## Contributing
-Contributions are welcome! Please submit a pull request or open an issue for suggestions or bug reports.
+
+Raise issues or pull requests on the repository. Small, focused changes (tests, docs, bugfixes) are easiest to review.

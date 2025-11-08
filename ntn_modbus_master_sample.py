@@ -17,7 +17,11 @@ from time import time
 def parse_arguments():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST")
-    parser.add_argument("--type", type=str, help="Specify NIDD or UDP", default='NIDD')
+    parser.add_argument("--ntn_config", action='store_true', help="NTN dongle config", default=False)
+    parser.add_argument("--remote_port", type=str, help="Specify remote port", default='')
+    parser.add_argument("--apn", type=str, help="Specify APN", default='')
+    parser.add_argument("--ip", type=str, help="Specify IP", default='')
+    parser.add_argument("--local_port", type=str, help="Specify local port", default='')
     parser.add_argument("--port", type=str, help="Specify port", default='/dev/ttyUSB0')
     parser.add_argument("--upload", action='store_true', help="Enable upload test", default=False)
     parser.add_argument("--dl", action='store_true', help="Enable downlink test", default=False)
@@ -99,6 +103,27 @@ class ntn_modbus_master:
         chunks[-1] = chunks[-1].ljust(2, b'0')
         return ntn_modbus_master._bytes_to_integers(chunks)
 
+    @staticmethod
+    def string_to_ascii_list(input_str):
+        """Convert a string to a list of 16-bit ASCII values.
+        Each element in the output list represents two ASCII characters.
+        If the string length is odd, it's padded with a NUL byte ("\x00").
+        Example:
+            '7000' -> [0x3730, 0x3030]  # '70' -> 0x3730, '00' -> 0x3030
+            '700'  -> [0x3730, 0x3000]  # '70' -> 0x3730, '0' + '\x00' -> 0x3000
+        """
+        # Pad with NUL byte if odd length so the last pair becomes <char><NUL>
+        if len(input_str) % 2:
+            input_str += '\x00'
+
+        # Convert pairs of characters to 16-bit integers (big-endian)
+        result = []
+        for i in range(0, len(input_str), 2):
+            pair = input_str[i:i+2]
+            ascii_val = (ord(pair[0]) << 8) | ord(pair[1])
+            result.append(ascii_val)
+        return result
+
 def dl_read(ntn_dongle):
     """Continuously read downlink data from the device."""
     while True:
@@ -118,7 +143,7 @@ def dl_read(ntn_dongle):
             logger.error(f"Error in downlink_modbus: {e}")
             sleep(1)
 
-def setup_ntn_device(ntn_dongle):
+def ntn_config(ntn_dongle, remote_port:str, apn:str, ip:str, local_port:str=None):
     """Set up the NTN dongle: password, info, and log device details."""
     DEFAULT_PASSWD = '00000000'
     passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
@@ -129,9 +154,67 @@ def setup_ntn_device(ntn_dongle):
         sys.exit(1)
     logger.info(f'Password set successfully')
 
+    """Configure the NTN dongle with specific settings."""
+    sn = ntn_dongle.read_registers(0xEA60, 6)
+    if not sn:
+        logger.error(f'SN read failed')
+        sys.exit(1)
+    logger.info(f'SN: {sn}')
+
+    payload = ntn_modbus_master.string_to_ascii_list(remote_port)
+    ret = ntn_dongle.set_registers(0xC3B8, payload)
+    if ret:
+        logger.info(f'Remote port set to: {remote_port}')
+    else:
+        logger.error(f'Failed to set remote port')
+
+    payload = ntn_modbus_master.string_to_ascii_list(apn)
+    ret = ntn_dongle.set_registers(0xC3BB, payload)
+    if ret:
+        logger.info(f'APN set to: {apn}')
+    else:
+        logger.error(f'Failed to set APN')
+
+    payload = ntn_modbus_master.string_to_ascii_list(ip)
+    ret = ntn_dongle.set_registers(0xC3CA, payload)
+    if ret:
+        logger.info(f'IP set to: {ip}')
+    else:
+        logger.error(f'Failed to set IP')
+
+    if local_port is None:
+        local_port = '55001'
+    payload = ntn_modbus_master.string_to_ascii_list(local_port)
+    ret = ntn_dongle.set_registers(0xC3D5, payload)
+    if ret:
+        logger.info(f'Local port set to: {local_port}')
+    else:
+        logger.error(f'Failed to set local port')
+
+def ntn_info(ntn_dongle):
+    """Set up the NTN dongle: password, info, and log device details."""
+    DEFAULT_PASSWD = '00000000'
+    passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
+    logger.info(f'password: {passwd}')
+    valid_passwd = ntn_dongle.set_registers(0x0000, passwd)
+    if not valid_passwd:
+        logger.error(f'Password set failed')
+        sys.exit(1)
+    logger.info(f'Password set successfully')
+
+    """Set up the NTN dongle: password, info, and log device details."""
+    sn = ntn_dongle.read_registers(0xEA60, 6)
+    if not sn:
+        logger.error(f'SN read failed')
+        sys.exit(1)
+
     def log_reg(desc, resp):
         if resp:
             logger.info(f'{desc}: {ntn_modbus_master.modbus_data_to_string(resp)}')
+    log_reg('remote port: ', ntn_dongle.read_registers(0xC3B8, 3, functioncode=3))
+    log_reg('APN Name: ', ntn_dongle.read_registers(0xC3BB, 15, functioncode=3))
+    log_reg('remote IP: ', ntn_dongle.read_registers(0xC3CA, 8, functioncode=3))
+    log_reg('local port: ', ntn_dongle.read_registers(0xC3D5, 3, functioncode=3))
 
     log_reg('SN', ntn_dongle.read_registers(0xEA60, 6))
     log_reg('Model Name', ntn_dongle.read_registers(0xEA66, 5))
@@ -155,40 +238,20 @@ def ntn_status_loop(ntn_dongle, args):
         net_status = False
         ntn_status = ntn_dongle.read_register(0xEA71)
         if ntn_status:
-            if args.type == 'NIDD':
-                module_at_ready = ntn_status & 0x01
-                downlink_ready = (ntn_status & 0x02) >> 1
-                sim_ready = (ntn_status & 0x04) >> 2
-                network_registered = (ntn_status & 0x08) >> 3
-                logger.info('=== NTN dongle status ===')
-                logger.info(f'{module_at_ready=}')
-                logger.info(f'{downlink_ready=}')
-                logger.info(f'{sim_ready=}')
-                logger.info(f'{network_registered=}')
-                if (ntn_status & 0xF) == 0xF:
-                    net_status = True
-            elif args.type == 'UDP':
-                module_at_ready = ntn_status & 0x01
-                ip_ready = (ntn_status & 0x02) >> 1
-                sim_ready = (ntn_status & 0x04) >> 2
-                network_registered = (ntn_status & 0x08) >> 3
-                socket_ready = (ntn_status & 0x10) >> 4
-                logger.info('=== NTN dongle status ===')
-                logger.info(f'{module_at_ready=}')
-                logger.info(f'{ip_ready=}')
-                logger.info(f'{sim_ready=}')
-                logger.info(f'{network_registered=}')
-                logger.info(f'{socket_ready=}')
-                if (ntn_status & 0x1F) == 0x1F:
-                    net_status = True
-            else:
-                logger.error(f'Wrong NTN type, input is :{args.type}')
+            module_at_ready = ntn_status & 0x01
+            ip_ready = (ntn_status & 0x02) >> 1
+            sim_ready = (ntn_status & 0x04) >> 2
+            network_registered = (ntn_status & 0x08) >> 3
+            socket_ready = (ntn_status & 0x10) >> 4
+            logger.info('=== NTN dongle status ===')
+            logger.info(f'{module_at_ready=}')
+            logger.info(f'{ip_ready=}')
+            logger.info(f'{sim_ready=}')
+            logger.info(f'{network_registered=}')
+            logger.info(f'{socket_ready=}')
+            if ntn_status == 0x1F:
+                net_status = True
 
-        avbl = ntn_dongle.read_register(0xEA7D)
-        logger.info(f'{avbl=}')
-        upload_avbl = True if ntn_dongle.read_register(0xEA7D)==0 else False
-
-        if net_status and upload_avbl:
             if args.upload:
                 data_list = []
                 rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
@@ -230,18 +293,29 @@ def ntn_status_loop(ntn_dongle, args):
                                 break
                             else:
                                 sleep(1)
-        sleep(10*60)
+        sleep(30)
 
 def main():
     args = parse_arguments()
-    logger.info(f'WARNING *** You set to run NTN dongle on "{args.type}" mode ***')
     NTN_DONGLE_ADDR = 1
     try:
         ntn_dongle = ntn_modbus_master(NTN_DONGLE_ADDR, port=args.port, baudrate=115200)
         if args.dl:
             dl_thread = threading.Thread(target=dl_read, args=(ntn_dongle,))
             dl_thread.start()
-        setup_ntn_device(ntn_dongle)
+        if args.ntn_config:
+            print(f'Remote port: {args.remote_port}')
+            print(f'APN: {args.apn}')
+            print(f'IP: {args.ip}')
+            print(f'Local port: {args.local_port}')
+            if args.remote_port == '' or args.apn == '' or args.ip == '':
+                logger.error(f'Please provide remote_port, apn, and ip for configuration.')
+                sys.exit(1)
+            ntn_config(ntn_dongle, args.remote_port, args.apn, args.ip, args.local_port)
+            logger.info(f'NTN dongle configured successfully.')
+            logger.info(f'Please unplug the NTN dongle and plug it back in to apply new settings.')
+            return
+        ntn_info(ntn_dongle)
         ntn_status_loop(ntn_dongle, args)
     except Exception as e:
         logger.error(f'{e} - Code={e}')
