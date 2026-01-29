@@ -108,8 +108,8 @@ def dl_read(ntn_dongle):
                 logger.info(f'Downlink data length: {data_len}')
                 dl_resp = ntn_dongle.read_registers(0xEC61, data_len)
                 logger.info(f'Downlink data response: {dl_resp}')
-                dl_data = b''.join(struct.pack('>H', v) for v in dl_resp)
-                dl_data = json.loads(binascii.unhexlify(dl_data).decode('utf-8'))
+                dl_data = b''.join(struct.pack('>H', v) for v in dl_resp).decode()
+                dl_data = bytes.fromhex(dl_data).decode('utf-8')
                 logger.info(f'Downlink data: {dl_data}')
             else:
                 logger.debug(f'Downlink data length: {data_len}')
