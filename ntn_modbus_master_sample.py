@@ -212,8 +212,8 @@ def ntn_status_loop(ntn_dongle, args):
                     logger.info(f'd_bytes: {d_bytes}')
                     d_hex = binascii.hexlify(d_bytes)
                     logger.info(f'packet: {d_hex}')
+                    d_hex += b'\r\n'
                     modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
-                    modbus_data.extend([3338])
                     logger.info(f'modbus data: {modbus_data}')
                     response = ntn_dongle.set_registers(0xC550, modbus_data)
                     logger.info(f'response: {response}')
