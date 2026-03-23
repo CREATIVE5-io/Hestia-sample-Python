@@ -25,11 +25,16 @@ def parse_arguments():
     parser.add_argument("--port", type=str, help="Specify port", default='/dev/ttyUSB0')
     parser.add_argument("--upload", action='store_true', help="Enable upload test", default=False)
     parser.add_argument("--dl", action='store_true', help="Enable downlink test", default=False)
+    parser.add_argument("--bin_file", type=str, help="Binary file to upload via NTN dongle", default=None)
     return parser.parse_args()
 
 # === Globals ===
 PORT_LOCK = threading.Lock()
 logger = modbus_tk.utils.create_logger('console')
+
+# Uplink register map (per register table)
+UPLINK_PART_ADDRS = [0xC550, 0xC590, 0xC5D0, 0xC610, 0xC650]
+UPLINK_CHUNK_SIZE = 64  # bytes per part (64 registers × 2 bytes)
 
 class ntn_modbus_master:
     """Modbus RTU master for NTN dongle communication."""
@@ -123,6 +128,44 @@ class ntn_modbus_master:
             ascii_val = (ord(pair[0]) << 8) | ord(pair[1])
             result.append(ascii_val)
         return result
+
+def upload_bin_file(ntn_dongle, filepath):
+    """Upload a binary file via NTN dongle using multi-part Modbus registers.
+
+    Data is split into UPLINK_CHUNK_SIZE-byte chunks. Each chunk is hex-encoded
+    (doubling to 128 bytes / 64 registers) and written to successive part addresses
+    (0xC550, 0xC590, ...). The last two hex bytes of the final chunk are replaced
+    with \\r\\n appended as a terminator.
+    """
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        logger.error(f'Failed to read {filepath}: {e}')
+        return False
+
+    logger.info(f'Uploading binary: {filepath} ({len(data)} bytes)')
+    if len(data) < 2:
+        logger.error('File too small (need at least 2 bytes)')
+        return False
+
+    chunks = [data[i:i+UPLINK_CHUNK_SIZE] for i in range(0, len(data), UPLINK_CHUNK_SIZE)]
+    if len(chunks) > len(UPLINK_PART_ADDRS):
+        logger.error(f'File too large ({len(data)} bytes); max {len(UPLINK_PART_ADDRS) * UPLINK_CHUNK_SIZE} bytes')
+        return False
+
+    for i, (chunk, addr) in enumerate(zip(chunks, UPLINK_PART_ADDRS)):
+        d_hex = binascii.hexlify(chunk)
+        if i == len(chunks) - 1:
+            d_hex = d_hex + b'\r\n'  # append CRLF terminator to last chunk
+        modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
+        logger.info(f'Part {i+1}: addr=0x{addr:04X}, {len(modbus_data)} regs')
+        if not ntn_dongle.set_registers(addr, modbus_data):
+            logger.error(f'Failed to write uplink part {i+1}')
+            return False
+
+    logger.info('Binary upload sent')
+    return True
 
 def dl_read(ntn_dongle):
     """Continuously read downlink data from the device."""
@@ -252,6 +295,20 @@ def ntn_status_loop(ntn_dongle, args):
             if ntn_status == 0x1F:
                 net_status = True
 
+        if net_status:
+            if args.bin_file:
+                if upload_bin_file(ntn_dongle, args.bin_file):
+                    while True:
+                        data_len = ntn_dongle.read_register(0xF060)
+                        if data_len != 0:
+                            logger.info(f'reply data len: {data_len}')
+                            data_resp = ntn_dongle.read_registers(0xF061, data_len)
+                            if data_resp:
+                                uplink_resp = ntn_modbus_master.modbus_data_to_string(data_resp)
+                                logger.info(f'Uplink response: {uplink_resp}')
+                            break
+                        else:
+                            sleep(1)
             if args.upload:
                 data_list = []
                 rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
