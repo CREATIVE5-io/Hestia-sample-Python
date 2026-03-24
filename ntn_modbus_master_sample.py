@@ -17,12 +17,12 @@ from time import time
 def parse_arguments():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST")
-    parser.add_argument("--type", type=str, help="Specify NIDD or UDP", default='UDP')
-    parser.add_argument("--port", type=str, help="Specify port", default='/dev/ttyUSB0')
-    parser.add_argument("--upload", action='store_true', help="Enable upload test", default=False)
+    parser.add_argument("--type", type=str, help="Specify NIDD or UDP (default: UDP)", default='UDP')
+    parser.add_argument("--port", type=str, help="Specify port (default: /dev/ttyUSB0)", default='/dev/ttyUSB0')
+    parser.add_argument("--upload", action='store_true', help="Enable upload test (default: False)", default=False)
     parser.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'all'], default='all',
-                        help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, 'all' for both")
-    parser.add_argument("--dl", action='store_true', help="Enable downlink test", default=False)
+                        help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, 'all' for both (default: all)")
+    parser.add_argument("--dl", action='store_true', help="Enable downlink test (default: False)", default=False)
     return parser.parse_args()
 
 # === Globals ===
