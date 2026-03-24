@@ -20,6 +20,8 @@ def parse_arguments():
     parser.add_argument("--type", type=str, help="Specify NIDD or UDP", default='NIDD')
     parser.add_argument("--port", type=str, help="Specify port", default='/dev/ttyUSB0')
     parser.add_argument("--upload", action='store_true', help="Enable upload test", default=False)
+    parser.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'all'], default='all',
+                        help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, 'all' for both")
     parser.add_argument("--dl", action='store_true', help="Enable downlink test", default=False)
     return parser.parse_args()
 
@@ -190,22 +192,44 @@ def ntn_status_loop(ntn_dongle, args):
 
         if net_status and upload_avbl:
             if args.upload:
-                data_list = []
-                rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
-                if rsrp_resp:
-                    logger.info(f'rsrp_resp: {rsrp_resp}')
-                    rsrp = ntn_modbus_master.modbus_data_to_string(rsrp_resp)
-                    if rsrp:
-                        logger.info(f'RSRP: {repr(rsrp)}')
-                        data_list.append(int(rsrp))
-                sinr_resp = ntn_dongle.read_registers(0xEB13, 2)
-                if sinr_resp:
-                    sinr = ntn_modbus_master.modbus_data_to_string(sinr_resp)
-                    if sinr:
-                        logger.info(f'SINR: {sinr}')
-                        data_list.append(int(sinr))
-                if data_list:
-                    data = {'c': data_list}
+                packets = []
+
+                if args.ud_type in ('signal', 'all'):
+                    signal_list = []
+                    rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
+                    if rsrp_resp:
+                        logger.info(f'rsrp_resp: {rsrp_resp}')
+                        rsrp = ntn_modbus_master.modbus_data_to_string(rsrp_resp)
+                        if rsrp:
+                            logger.info(f'RSRP: {repr(rsrp)}')
+                            signal_list.append(int(rsrp))
+                    sinr_resp = ntn_dongle.read_registers(0xEB13, 2)
+                    if sinr_resp:
+                        sinr = ntn_modbus_master.modbus_data_to_string(sinr_resp)
+                        if sinr:
+                            logger.info(f'SINR: {sinr}')
+                            signal_list.append(int(sinr))
+                    if signal_list:
+                        packets.append({'c': signal_list})
+
+                if args.ud_type in ('gps', 'all'):
+                    gps_list = []
+                    lat_resp = ntn_dongle.read_registers(0xEB1B, 5)
+                    if lat_resp:
+                        lat = ntn_modbus_master.modbus_data_to_string(lat_resp)
+                        if lat:
+                            logger.info(f'Latitude: {lat}')
+                            gps_list.append(float(lat))
+                    long_resp = ntn_dongle.read_registers(0xEB20, 6)
+                    if long_resp:
+                        long = ntn_modbus_master.modbus_data_to_string(long_resp)
+                        if long:
+                            logger.info(f'Longitude: {long}')
+                            gps_list.append(float(long))
+                    if gps_list:
+                        packets.append({'g': gps_list})
+
+                for data in packets:
                     d_str = json.dumps(data)
                     logger.info(f'd_str: {d_str}')
                     d_bytes = d_str.encode('utf-8')
