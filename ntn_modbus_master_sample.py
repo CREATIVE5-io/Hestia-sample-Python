@@ -17,7 +17,7 @@ from time import time
 def parse_arguments():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST")
-    parser.add_argument("--type", type=str, help="Specify NIDD or UDP", default='NIDD')
+    parser.add_argument("--type", type=str, help="Specify NIDD or UDP", default='UDP')
     parser.add_argument("--port", type=str, help="Specify port", default='/dev/ttyUSB0')
     parser.add_argument("--upload", action='store_true', help="Enable upload test", default=False)
     parser.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'all'], default='all',
