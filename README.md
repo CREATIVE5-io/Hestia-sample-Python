@@ -1,77 +1,86 @@
 # NTN Dongle Test
 
-This Python script is designed to test and interact with an NTN Modbus Master device over a serial connection using the Modbus RTU protocol. It provides functionality to read device information, monitor status, and perform uplink/downlink data operations.
+Python scripts for testing and controlling NTN (Non-Terrestrial Network) modems with integrated LoRa modules over Modbus RTU.
+
+## Scripts
+
+| File | Purpose |
+|------|---------|
+| `ntn_modbus_master_sample.py` | Main script — NIDD/UDP testing, uplink/downlink |
 
 ## Features
-- Reads device details such as Serial Number, Model Name, Firmware Version, Hardware Version, Modbus ID, and Heartbeat.
-- Retrieves NTN-specific data like IMSI, SINR, RSRP, GPS Latitude, and Longitude.
-- Monitors NTN module status (AT readiness, SIM status, network registration, etc.).
-- Supports optional downlink data reading via a separate thread.
-- Supports optional uplink data transmission with periodic reporting (e.g., SINR, RSRP).
-- Thread-safe Modbus communication using a port lock.
-- Detailed console logging for debugging and monitoring.
+
+- Reads device info: Serial Number, Model Name, Firmware/Hardware versions, Modbus ID, Heartbeat
+- Retrieves NTN metrics: IMSI, SINR, RSRP, GPS Latitude/Longitude
+- Monitors NTN module status (AT ready, SIM ready, network registered, socket ready)
+- Supports NIDD and UDP protocol modes
+- Optional downlink data reading in a separate thread
+- Optional uplink data transmission (signal metrics and/or GPS)
+- LoRa key provisioning via AT command passthrough
+- Thread-safe Modbus communication using a port lock
 
 ## Prerequisites
+
 - Python 3.6+
-- Required Python packages:
-  - `modbus_tk`
-  - `pyserial`
-- A compatible NTN Modbus Master device connected via a serial port (e.g., `/dev/ttyUSB0`).
+- `modbus_tk==1.1.5`
+- `pyserial==3.5`
+- NTN Modbus device connected via serial port (e.g., `/dev/ttyUSB0`)
 
 ## Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/CREATIVE5-io/Hestia-sample-Python.git
-   cd Hestia-sample-Python
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-## Usage
-Run the script with optional command-line arguments:
 
 ```bash
-python ntn_modbus_master_sample.py [--port <serial_port>] [--upload] [--dl]
+git clone https://github.com/CREATIVE5-io/Hestia-sample-Python.git
+cd Hestia-sample-Python
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+python ntn_modbus_master_sample.py [options]
 ```
 
 ### Arguments
-- `--type`: Protocol to use on NTN service (default: `NIDD`).
-- `--port`: Serial port of the device (default: `/dev/ttyUSB0`).
-- `--upload`: Enable periodic uplink data transmission (optional).
-- `--dl`: Enable continuous downlink data reading in a separate thread (optional).
 
-### Example
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--type` | Protocol mode: `NIDD` or `UDP` | `UDP` |
+| `--port` | Serial port | `/dev/ttyUSB0` |
+| `--upload` | Enable uplink data transmission | `False` |
+| `--ud_type` | Upload data type: `signal`, `gps`, or `all` | `all` |
+| `--dl` | Enable downlink reading in a separate thread | `False` |
+
+### Examples
+
 ```bash
+# UDP mode with uplink (signal + GPS) and downlink
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --dl
+
+# NIDD mode, upload signal data only
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --type NIDD --upload --ud_type signal
+
+# Raw AT command passthrough
+python ntn_modbus_to_atCmd.py --port /dev/ttyUSB0
 ```
 
-## Script Overview
-The script:
-1. Parses command-line arguments for port, uplink, and downlink options.
-2. Initializes a Modbus RTU master connection with the specified port and slave address (default: 1).
-3. Sets a default password (`00000000`) for device access.
-4. Reads and logs device information (Serial Number, Model Name, Firmware/Hardware Versions, Modbus ID, Heartbeat).
-5. Retrieves and logs NTN-specific data (IMSI, SINR, RSRP, GPS coordinates).
-6. Continuously checks NTN module status until fully ready (AT, SIM, network registered).
-7. If `--dl` is enabled, starts a thread to monitor and log downlink data.
-8. If `--upload` is enabled, periodically sends uplink data (SINR, RSRP) every 10 minutes and logs responses.
-9. Uses a threading lock to ensure thread-safe Modbus communication.
+## Status Register (`0xEA71`) Bit Flags
 
-## Logging
-- Logs are output to the console with levels `INFO`, `DEBUG`, and `ERROR`.
-- Includes detailed information about Modbus transactions, data conversions, and errors.
+| Mode | Ready condition |
+|------|----------------|
+| NIDD | bits 0–3 all set (`0x0F`): AT ready, downlink ready, SIM ready, network registered |
+| UDP  | bits 0–4 all set (`0x1F`): same as NIDD plus socket ready |
 
 ## Troubleshooting
-- Ensure the serial port is correct and accessible.
-- Verify the device is powered on and configured with the correct Modbus ID (default: 1).
-- Check that dependencies (`modbus_tk`, `pyserial`) are installed.
-- If downlink or uplink operations fail, confirm the device is in a ready state (use status logs).
-- Increase the Modbus timeout (`self.master.set_timeout`) if communication errors occur.
+
+- Verify the serial port is accessible and the device is powered on
+- Default Modbus slave ID is 1; default password is `00000000`
+- Increase `self.master.set_timeout` if communication errors occur
+- Check status log output to confirm the device reaches ready state before uplink/downlink
 
 ## License
+
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
+
 Contributions are welcome! Please submit a pull request or open an issue for suggestions or bug reports.
