@@ -51,6 +51,7 @@ python ntn_modbus_master_sample.py [options]
 | `--port` | Serial port | `/dev/ttyUSB0` |
 | `--upload` | Enable uplink data transmission | `False` |
 | `--ud_type` | Upload data type: `signal`, `gps`, or `all` | `all` |
+| `--ud_data` | Raw upload data string sent as-is; overrides `--ud_type`, implies `--upload` | `None` |
 | `--dl` | Enable downlink reading in a separate thread | `False` |
 | `--interval` | Status loop interval in seconds | `600` |
 
@@ -85,6 +86,9 @@ Require `lora.ini` in the same directory. Auto-created with defaults if missing.
 ```bash
 # UDP mode with uplink (signal + GPS) and downlink, 30-second polling
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --dl --interval 30
+
+# Send a fixed raw string as uplink payload (bypasses --ud_type)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ud_data '{"c":[42,-80]}'
 
 # NIDD mode, upload signal data only
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --type NIDD --upload --ud_type signal
