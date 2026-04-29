@@ -196,17 +196,32 @@ class ntn_modbus_master:
 
 def dl_read(ntn_dongle):
     """Continuously read downlink data from the device (runs in a daemon thread)."""
+    MAX_REGS_PER_READ = 64  # match NTN downlink data part size (EC61–ECA0)
     while True:
         try:
             data_len = 0
+            error = False
             data_len = ntn_dongle.read_register(0xEC60)
             if data_len != 0:
                 logger.info(f'Downlink data length: {data_len}')
-                dl_resp = ntn_dongle.read_registers(0xEC61, data_len)
-                logger.info(f'Downlink data response: {dl_resp}')
-                dl_data = b''.join(struct.pack('>H', v) for v in dl_resp)
-                dl_data = json.loads(binascii.unhexlify(dl_data).decode('utf-8'))
-                logger.info(f'Downlink data: {dl_data}')
+                dl_resp = []
+                addr = 0xEC61
+                remaining = data_len
+                while remaining > 0:
+                    chunk = min(remaining, MAX_REGS_PER_READ)
+                    regs = ntn_dongle.read_registers(addr, chunk)
+                    if regs == None:
+                        error = True
+                        break
+                    dl_resp.extend(regs)
+                    addr += chunk
+                    remaining -= chunk
+                if not error:
+                    logger.info(f'Downlink data response: {dl_resp}')
+                    dl_data = b''.join(struct.pack('>H', v) for v in dl_resp)
+                    dl_data = json.loads(binascii.unhexlify(dl_data).decode('utf-8'))
+                    logger.info(f'Downlink data: {dl_data}')
+                sleep(1)
             else:
                 logger.debug(f'Downlink data length: {data_len}')
                 sleep(1)
@@ -485,7 +500,13 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                     d_hex += b'\r\n'
                     modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
                     logger.info(f'modbus data: {modbus_data}')
-                    response = ntn_dongle.set_registers(0xC550, modbus_data)
+                    MAX_REGS_PER_WRITE = 64  # match NTN uplink data part size (C550–C58F)
+                    response = False
+                    for i in range(0, len(modbus_data), MAX_REGS_PER_WRITE):
+                        chunk = modbus_data[i:i + MAX_REGS_PER_WRITE]
+                        response = ntn_dongle.set_registers(0xC550 + i, chunk)
+                        if not response:
+                            break
                     logger.info(f'response: {response}')
                     if response:
                         while True:
