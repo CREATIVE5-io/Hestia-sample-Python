@@ -38,9 +38,9 @@ def parse_arguments():
     # LoRa (A2 hardware)
     parser.add_argument("--lora", action='store_true', help="Enable LoRa data polling in status loop (default: False)", default=False)
     parser.add_argument("--lora_setup", action='store_true', help="Enable LoRa module setup", default=False)
-    parser.add_argument("--lora_privkey_query", action='store_true', help="Query LoRa private keys", default=False)
-    parser.add_argument("--lora_privkey_setup", action='store_true', help="Setup LoRa private keys from lora.ini", default=False)
-    parser.add_argument("--lora_privkey_cleanup", action='store_true', help="Cleanup all LoRa private keys", default=False)
+    parser.add_argument("--lora_node_query", action='store_true', help="Query LoRa node keys (private + OTAA EUI)", default=False)
+    parser.add_argument("--lora_node_setup", action='store_true', help="Setup LoRa node keys (private + OTAA EUI) from lora.ini", default=False)
+    parser.add_argument("--lora_node_cleanup", action='store_true', help="Cleanup all LoRa node keys (private + OTAA EUI)", default=False)
     parser.add_argument("--lora_pubkey_setup", action='store_true', help="Setup LoRa public key from lora.ini", default=False)
     parser.add_argument("--lora_pubkey_cleanup", action='store_true', help="Cleanup LoRa public key", default=False)
     return parser.parse_args()
@@ -255,7 +255,7 @@ class LoraConfig:
             'ch_plan': lora.get('ch_plan', '0')
         }
 
-    def get_devices(self):
+    def get_private_keys(self):
         section = 'PRIVATE_KEY' if 'PRIVATE_KEY' in self.config else 'DEVICES'
         return dict(self.config[section]) if section in self.config else {}
 
@@ -263,6 +263,9 @@ class LoraConfig:
         if 'PUBLIC_KEY' in self.config and 'pubkey' in self.config['PUBLIC_KEY']:
             return self.config['PUBLIC_KEY']['pubkey']
         return None
+
+    def get_otaa_eui(self):
+        return dict(self.config['OTAA_EUI']) if 'OTAA_EUI' in self.config else {}
 
 
 def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str = None):
@@ -336,6 +339,9 @@ def setup_lora(ntn_dongle, lora_conf, args):
     logger.info('--- LoRa Setup ---')
     data = ntn_dongle.pcie2_cmd('AT+BISFMT=1')
     logger.info(f'response: {data}')
+    fw_ver = get_lora_fw_ver(ntn_dongle)
+    otaa_supported = fw_ver is not None and _ver_tuple(fw_ver) >= (1, 3, 0)
+    logger.info(f'LoRa FW version: {fw_ver}, OTAA supported: {otaa_supported}')
     params = lora_conf.get_lora_params()
     freq, sf, ch = params['frequency'], params['sf'], params['ch_plan']
     ch_plan_map = {"AS923": 0, "US915": 1, "AU915": 2, "EU868": 3, "KR920": 4, "IN865": 5, "RU864": 6}
@@ -360,19 +366,42 @@ def setup_lora(ntn_dongle, lora_conf, args):
             data = ntn_dongle.pcie2_cmd('AT+BISCHPLAN=' + ch)
             logger.info(f'response: {data}')
 
-    if args.lora_privkey_setup:
-        devices = lora_conf.get_devices()
+    if args.lora_node_setup:
+        devices = lora_conf.get_private_keys()
+        otaa = lora_conf.get_otaa_eui()
         logger.info(f'LoRa devices: {devices}')
+        logger.info(f'LoRa OTAA EUI: {otaa}')
+        # Build a lookup from index string to OTAA value
+        otaa_by_index = {}
+        for v in otaa.values():
+            parts = v.split(':', 1)
+            if parts:
+                otaa_by_index[parts[0]] = v
         for k, v in devices.items():
             logger.debug(f'AT+BISDEV={v}')
             data = ntn_dongle.pcie2_cmd('AT+BISDEV=' + v)
             logger.debug(f'response: {data}')
+            index = v.split(':')[0]
+            if index in otaa_by_index:
+                if otaa_supported:
+                    otaa_cmd = 'AT+BISOTAA=' + otaa_by_index[index]
+                    logger.debug(otaa_cmd)
+                    data = ntn_dongle.pcie2_cmd(otaa_cmd)
+                    logger.debug(f'response: {data}')
+                else:
+                    logger.warning(f'Skipping OTAA for index {index}: FW {fw_ver} < V1.3.0')
 
-    if args.lora_privkey_cleanup:
+    if args.lora_node_cleanup:
         for i in range(16):
             cmd = f'AT+BISDEV={i}:ffffffff:ffffffffffffffffffffffffffffffff:ffffffffffffffffffffffffffffffff'
             data = ntn_dongle.pcie2_cmd(cmd)
             logger.info(f'response: {data}')
+            if otaa_supported:
+                cmd = f'AT+BISOTAA={i}:ffffffffffffffff:ffffffffffffffff:ffffffffffffffffffffffffffffffff'
+                data = ntn_dongle.pcie2_cmd(cmd)
+                logger.info(f'response: {data}')
+            else:
+                logger.warning(f'Skipping OTAA cleanup for slot {i}: FW {fw_ver} < V1.3.0')
 
     if args.lora_pubkey_setup:
         pubkey = lora_conf.get_pubkey()
@@ -390,8 +419,31 @@ def setup_lora(ntn_dongle, lora_conf, args):
     logger.info(f'response: {data}')
 
 
-def lora_privkey_query(ntn_dongle):
-    """Query and log LoRa private key slot 0."""
+def get_lora_fw_ver(ntn_dongle):
+    """Query LoRa module firmware version via AT+VER=? and return the version string."""
+    data = ntn_dongle.pcie2_cmd('AT+VER=?')
+    if not data:
+        return None
+    return next((line.strip() for line in data.splitlines() if line.strip() and line.strip() != 'OK'), None)
+
+
+def _ver_tuple(ver_str):
+    """Parse version string like 'V1.3.0' into a comparable tuple (1, 3, 0)."""
+    try:
+        return tuple(int(x) for x in ver_str.lstrip('Vv').split('.'))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
+def lora_node_query(ntn_dongle):
+    """Query and log LoRa node keys (private keys and OTAA EUI) for all 16 slots."""
+    version = get_lora_fw_ver(ntn_dongle)
+    if version:
+        logger.info(f'LoRa module version: {version}')
+    else:
+        logger.error('LoRa version query failed')
+
+    otaa_supported = version is not None and _ver_tuple(version) >= (1, 3, 0)
     for i in range(16):
         cmd = f'AT+BISDEV={i}?'
         data = ntn_dongle.pcie2_cmd(cmd)
@@ -399,6 +451,15 @@ def lora_privkey_query(ntn_dongle):
             logger.info(f'Lora device {i}: {data}')
         else:
             logger.error(f'Lora device {i} query failed')
+        if otaa_supported:
+            cmd = f'AT+BISOTAA={i}?'
+            data = ntn_dongle.pcie2_cmd(cmd)
+            if data:
+                logger.info(f'Lora OTAA {i}: {data}')
+            else:
+                logger.error(f'Lora OTAA {i} query failed')
+        else:
+            logger.warning(f'Skipping OTAA query for slot {i}: FW {version} < V1.3.0')
 
 
 def ntn_status_loop(ntn_dongle, args, lora_conf):
@@ -523,7 +584,7 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                                 sleep(1)
 
         if args.lora:
-            devices = lora_conf.get_devices()
+            devices = lora_conf.get_private_keys()
             for i in range(len(devices)):
                 data = ntn_dongle.pcie2_cmd('AT+BISGET=?')
                 logger.info(f'{data=}')
@@ -552,11 +613,11 @@ def main():
             return
         ntn_info(ntn_dongle, args)
         # LoRa setup (A2 hardware)
-        if any([args.lora_setup, args.lora_privkey_cleanup, args.lora_privkey_setup,
+        if any([args.lora_setup, args.lora_node_cleanup, args.lora_node_setup,
                 args.lora_pubkey_setup, args.lora_pubkey_cleanup]):
             setup_lora(ntn_dongle, lora_conf, args)
-        if args.lora_privkey_query:
-            lora_privkey_query(ntn_dongle)
+        if args.lora_node_query:
+            lora_node_query(ntn_dongle)
         ntn_status_loop(ntn_dongle, args, lora_conf)
     except Exception as e:
         logger.error(f'{e}')
