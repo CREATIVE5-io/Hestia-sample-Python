@@ -219,8 +219,15 @@ def dl_read(ntn_dongle):
                 if not error:
                     logger.info(f'Downlink data response: {dl_resp}')
                     dl_data = b''.join(struct.pack('>H', v) for v in dl_resp)
-                    dl_data = json.loads(binascii.unhexlify(dl_data).decode('utf-8'))
-                    logger.info(f'Downlink data: {dl_data}')
+                    try:
+                        dl_text = binascii.unhexlify(dl_data).decode('utf-8').rstrip('\x00')
+                    except Exception:
+                        dl_text = dl_data.decode('utf-8', errors='replace').rstrip('\x00')
+                    try:
+                        dl_data = json.loads(dl_text)
+                        logger.info(f'Downlink data (JSON): {dl_data}')
+                    except json.JSONDecodeError:
+                        logger.info(f'Downlink data (text): {dl_text}')
                 sleep(1)
             else:
                 logger.debug(f'Downlink data length: {data_len}')
