@@ -18,7 +18,7 @@ Python scripts for testing and controlling NTN (Non-Terrestrial Network) modems 
 - Configures UDP network parameters (remote IP, port, APN, local port) via `--ntn_config`
 - Optional downlink data reading in a separate thread
 - Optional uplink data transmission (signal metrics and/or GPS) with configurable packet types
-- LoRa co-module (A2 hardware) key provisioning and AT command passthrough
+- LoRa co-module (A2 hardware) key provisioning (ABP private keys + OTAA EUI) and AT command passthrough
 - Configurable status loop interval via `--interval`
 - Thread-safe Modbus communication using a port lock
 
@@ -65,7 +65,7 @@ Used with `--ntn_config` to write network parameters to the device (one-shot, ex
 | `--remote_port` | Remote server port | `''` |
 | `--apn` | APN string | `''` |
 | `--ip` | Remote server IP address | `''` |
-| `--local_port` | Local port (optional) | `55001` |
+| `--local_port` | Local port (optional) | `''` (defaults to `55001` if omitted) |
 
 ### LoRa options (A2 hardware)
 
@@ -75,9 +75,9 @@ Require `lora.ini` in the same directory. Auto-created with defaults if missing.
 |----------|-------------|---------|
 | `--lora` | Enable LoRa data polling in the status loop | `False` |
 | `--lora_setup` | Configure LoRa module (frequency, SF, channel plan) | `False` |
-| `--lora_privkey_query` | Query LoRa private key slot 0 | `False` |
-| `--lora_privkey_setup` | Write private keys from `lora.ini` to device | `False` |
-| `--lora_privkey_cleanup` | Wipe all 16 private key slots | `False` |
+| `--lora_node_query` | Query all 16 LoRa node key slots (private keys + OTAA EUI) | `False` |
+| `--lora_node_setup` | Write private keys and OTAA EUI from `lora.ini` to device | `False` |
+| `--lora_node_cleanup` | Wipe all 16 private key slots and OTAA EUI entries | `False` |
 | `--lora_pubkey_setup` | Write public key from `lora.ini` to device | `False` |
 | `--lora_pubkey_cleanup` | Wipe public key | `False` |
 
@@ -97,11 +97,11 @@ python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --type NIDD --upload --ud
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ntn_config \
     --remote_port 55001 --apn my.apn.example --ip 1.2.3.4 --local_port 55002
 
-# LoRa key setup from lora.ini
-python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --lora_setup --lora_privkey_setup --lora_pubkey_setup
+# LoRa key setup from lora.ini (private keys + OTAA EUI + public key)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --lora_setup --lora_node_setup --lora_pubkey_setup
 
-# Query LoRa private key slot 0
-python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --lora_privkey_query
+# Query all 16 LoRa node key slots (private keys + OTAA EUI)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --lora_node_query
 
 # Raw AT command passthrough (no full device setup flow)
 python ntn_modbus_to_atCmd.py --port /dev/ttyUSB0
@@ -118,8 +118,13 @@ sf = 9
 ch_plan = 0   # 0=AS923, 1=US915, 2=AU915, 3=EU868, 4=KR920, 5=IN865, 6=RU864
 
 [PRIVATE_KEY]
+# ABP keys: <name> = <slot>:<devaddr>:<nwkskey>:<appskey>
 device1 = 0:<devaddr>:<nwkskey>:<appskey>
 device2 = 1:<devaddr>:<nwkskey>:<appskey>
+
+[OTAA_EUI]
+# OTAA keys (requires LoRa FW >= V1.3.0): <name> = <slot>:<DevEUI>:<AppEUI>:<AppKey>
+device1 = 0:<DevEUI>:<AppEUI>:<AppKey>
 
 [PUBLIC_KEY]
 pubkey = <hex_key>:<hex_key>
