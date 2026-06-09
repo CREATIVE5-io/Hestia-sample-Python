@@ -1,0 +1,21 @@
+[Unit]
+Description=Hestia NTN Modbus master (A3 Skylo)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/c5/ntn_modbus_master_sample.py \
+    --port /dev/ttyAMA0 \
+    --type NIDD \
+    --ud_fill \
+    --interval 120 \
+    --log_file A3_skylo.log
+WorkingDirectory=/home/c5
+StandardOutput=inherit
+StandardError=inherit
+Restart=on-failure
+RestartSec=10
+User=c5
+Group=c5
+
+[Install]
+WantedBy=multi-user.target
