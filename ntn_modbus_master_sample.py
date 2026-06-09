@@ -4,6 +4,7 @@ import binascii
 import configparser
 import json
 import logging
+import logging.handlers
 import os
 import re
 import struct
@@ -27,6 +28,10 @@ def parse_arguments():
                         help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, 'all' for both (default: all)")
     parser.add_argument("--ud_data", type=str, default=None,
                         help="Raw upload data string sent as-is; overrides --ud_type and implies --upload (default: None)")
+    parser.add_argument("--ud_size", type=int, default=150,
+                        help="Pad upload payload to this many bytes with '1234567890' fill (0=no padding, default: 150)")
+    parser.add_argument("--ud_fill", action='store_true', default=False,
+                        help="Send exactly --ud_size bytes of repeating '1234567890', no other data; implies --upload")
     parser.add_argument("--dl", action='store_true', help="Enable downlink test (default: False)", default=False)
     parser.add_argument("--interval", type=int, help="Status loop interval in seconds (default: 600)", default=600)
     # UDP device config
@@ -43,6 +48,8 @@ def parse_arguments():
     parser.add_argument("--lora_node_cleanup", action='store_true', help="Cleanup all LoRa node keys (private + OTAA EUI)", default=False)
     parser.add_argument("--lora_pubkey_setup", action='store_true', help="Setup LoRa public key from lora.ini", default=False)
     parser.add_argument("--lora_pubkey_cleanup", action='store_true', help="Cleanup LoRa public key", default=False)
+    parser.add_argument("--log_file", type=str, default='ntn_modbus.log',
+                        help="Log file path (default: ntn_modbus.log); set to '' to disable file logging")
     return parser.parse_args()
 
 # === Logger Setup ===
@@ -470,8 +477,10 @@ def lora_node_query(ntn_dongle):
 
 
 def ntn_status_loop(ntn_dongle, args, lora_conf):
-    """Main status loop: poll NTN status, upload telemetry, poll LoRa, then sleep --interval seconds."""
+    """Main status loop: poll NTN status, upload telemetry, poll LoRa, then sleep --interval seconds.
+    The interval is wall-clock based: sleep time = interval - elapsed work time."""
     while True:
+        t_start = time()
         net_status = False
         ntn_status = ntn_dongle.read_register(0xEA71)
         if ntn_status:
@@ -508,10 +517,42 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
         logger.info(f'{avbl=}')
         upload_avbl = ntn_dongle.read_register(0xEA7D) == 0
 
-        do_upload = args.upload or (args.ud_data is not None)
+        do_upload = args.upload or (args.ud_data is not None) or args.ud_fill
         if net_status and upload_avbl:
             if do_upload:
-                if args.ud_data is not None:
+                if args.ud_fill:
+                    # Fill path: send exactly ud_size bytes of repeating '1234567890'
+                    fill = b'1234567890'
+                    size = args.ud_size if args.ud_size > 0 else 150
+                    d_bytes = (fill * (size // len(fill) + 1))[:size]
+                    logger.info(f'd_bytes ({len(d_bytes)}B): {d_bytes}')
+                    d_hex = binascii.hexlify(d_bytes)
+                    logger.info(f'packet: {d_hex}')
+                    d_hex += b'\r\n'
+                    modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
+                    logger.info(f'modbus data: {modbus_data}')
+                    MAX_REGS_PER_WRITE = 64
+                    response = False
+                    for i in range(0, len(modbus_data), MAX_REGS_PER_WRITE):
+                        chunk = modbus_data[i:i + MAX_REGS_PER_WRITE]
+                        response = ntn_dongle.set_registers(0xC550 + i, chunk)
+                        if not response:
+                            break
+                    logger.info(f'response: {response}')
+                    if response:
+                        while True:
+                            data_len = ntn_dongle.read_register(0xF060)
+                            if data_len != 0:
+                                logger.info(f'reply data len: {data_len}')
+                                data_resp = ntn_dongle.read_registers(0xF061, data_len)
+                                logger.info(f'responsed data: {data_resp}')
+                                if data_resp:
+                                    uplink_resp = ntn_modbus_master.modbus_data_to_string(data_resp)
+                                    logger.info(f'Uplink response: {uplink_resp}')
+                                break
+                            else:
+                                sleep(1)
+                elif args.ud_data is not None:
                     # Raw data path: send --ud_data string directly, ignore --ud_type
                     raw_packets = [args.ud_data]
                     is_raw = True
@@ -555,40 +596,48 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                         if gps_list:
                             raw_packets.append({'g': gps_list})
 
-                for data in raw_packets:
-                    if is_raw:
-                        d_bytes = data.encode('utf-8')
-                    else:
-                        d_str = json.dumps(data)
-                        logger.info(f'd_str: {d_str}')
-                        d_bytes = d_str.encode('utf-8')
-                    logger.info(f'd_bytes: {d_bytes}')
-                    d_hex = binascii.hexlify(d_bytes)
-                    logger.info(f'packet: {d_hex}')
-                    d_hex += b'\r\n'
-                    modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
-                    logger.info(f'modbus data: {modbus_data}')
-                    MAX_REGS_PER_WRITE = 64  # match NTN uplink data part size (C550–C58F)
-                    response = False
-                    for i in range(0, len(modbus_data), MAX_REGS_PER_WRITE):
-                        chunk = modbus_data[i:i + MAX_REGS_PER_WRITE]
-                        response = ntn_dongle.set_registers(0xC550 + i, chunk)
-                        if not response:
-                            break
-                    logger.info(f'response: {response}')
-                    if response:
-                        while True:
-                            data_len = ntn_dongle.read_register(0xF060)
-                            if data_len != 0:
-                                logger.info(f'reply data len: {data_len}')
-                                data_resp = ntn_dongle.read_registers(0xF061, data_len)
-                                logger.info(f'responsed data: {data_resp}')
-                                if data_resp:
-                                    uplink_resp = ntn_modbus_master.modbus_data_to_string(data_resp)
-                                    logger.info(f'Uplink response: {uplink_resp}')
+                if not args.ud_fill:
+                    for data in raw_packets:
+                        if is_raw:
+                            d_bytes = data.encode('utf-8')
+                        else:
+                            d_str = json.dumps(data)
+                            logger.info(f'd_str: {d_str}')
+                            d_bytes = d_str.encode('utf-8')
+                        if args.ud_size > 0:
+                            if len(d_bytes) < args.ud_size:
+                                fill = b'1234567890'
+                                needed = args.ud_size - len(d_bytes)
+                                d_bytes = d_bytes + (fill * (needed // len(fill) + 1))[:needed]
+                            elif len(d_bytes) > args.ud_size:
+                                logger.warning(f'Upload data ({len(d_bytes)}B) exceeds --ud_size {args.ud_size}B')
+                        logger.info(f'd_bytes ({len(d_bytes)}B): {d_bytes}')
+                        d_hex = binascii.hexlify(d_bytes)
+                        logger.info(f'packet: {d_hex}')
+                        d_hex += b'\r\n'
+                        modbus_data = ntn_modbus_master.bytes_to_list_with_padding(d_hex)
+                        logger.info(f'modbus data: {modbus_data}')
+                        MAX_REGS_PER_WRITE = 64  # match NTN uplink data part size (C550–C58F)
+                        response = False
+                        for i in range(0, len(modbus_data), MAX_REGS_PER_WRITE):
+                            chunk = modbus_data[i:i + MAX_REGS_PER_WRITE]
+                            response = ntn_dongle.set_registers(0xC550 + i, chunk)
+                            if not response:
                                 break
-                            else:
-                                sleep(1)
+                        logger.info(f'response: {response}')
+                        if response:
+                            while True:
+                                data_len = ntn_dongle.read_register(0xF060)
+                                if data_len != 0:
+                                    logger.info(f'reply data len: {data_len}')
+                                    data_resp = ntn_dongle.read_registers(0xF061, data_len)
+                                    logger.info(f'responsed data: {data_resp}')
+                                    if data_resp:
+                                        uplink_resp = ntn_modbus_master.modbus_data_to_string(data_resp)
+                                        logger.info(f'Uplink response: {uplink_resp}')
+                                    break
+                                else:
+                                    sleep(1)
 
         if args.lora:
             devices = lora_conf.get_private_keys()
@@ -596,11 +645,21 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                 data = ntn_dongle.pcie2_cmd('AT+BISGET=?')
                 logger.info(f'{data=}')
 
-        sleep(args.interval)
+        elapsed = time() - t_start
+        wait = max(0, args.interval - elapsed)
+        logger.info(f'Loop done in {elapsed:.1f}s, sleeping {wait:.1f}s (interval={args.interval}s)')
+        sleep(wait)
 
 
 def main():
     args = parse_arguments()
+    if args.log_file:
+        file_handler = logging.handlers.RotatingFileHandler(
+            args.log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8')
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s    %(levelname)-8s %(name)s    %(threadName)s    %(message)s'))
+        logger.addHandler(file_handler)
+        logger.info(f'Logging to file: {args.log_file}')
     logger.info(f'WARNING *** NTN dongle mode: "{args.type}" | interval: {args.interval}s ***')
     NTN_DONGLE_ADDR = 1
     lora_conf = LoraConfig()
