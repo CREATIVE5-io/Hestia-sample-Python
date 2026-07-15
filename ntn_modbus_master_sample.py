@@ -89,6 +89,18 @@ class ntn_modbus_master:
                 logger.info(e)
                 return None
 
+    def set_register(self, reg, val):
+        with self.lock:
+            try:
+                if val is not None:
+                    self.master.execute(self.slaveAddr, cst.WRITE_SINGLE_REGISTER, reg, output_value=val)
+                    return True
+                else:
+                    return False
+            except Exception as e:
+                logger.info(e)
+                return False
+
     def set_registers(self, reg, val):
         with self.lock:
             try:
@@ -335,6 +347,7 @@ def ntn_info(ntn_dongle, args):
     log_reg('Model Name', ntn_dongle.read_registers(0xEA66, 5))
     log_reg('FW ver', ntn_dongle.read_registers(0xEA6B, 2))
     log_reg('HW Ver', ntn_dongle.read_registers(0xEA6D, 2))
+
     modbus_id = ntn_dongle.read_register(0xEA6F)
     if modbus_id:
         logger.info(f'Modbus ID: {modbus_id}')
@@ -355,7 +368,8 @@ def setup_lora(ntn_dongle, lora_conf, args):
     logger.info(f'response: {data}')
     fw_ver = get_lora_fw_ver(ntn_dongle)
     otaa_supported = fw_ver is not None and _ver_tuple(fw_ver) >= (1, 3, 0)
-    logger.info(f'LoRa FW version: {fw_ver}, OTAA supported: {otaa_supported}')
+    node_count = get_max_node_count(fw_ver)
+    logger.info(f'LoRa FW version: {fw_ver}, OTAA supported: {otaa_supported}, node count: {node_count}')
     params = lora_conf.get_lora_params()
     freq, sf, ch = params['frequency'], params['sf'], params['ch_plan']
     ch_plan_map = {"AS923": 0, "US915": 1, "AU915": 2, "EU868": 3, "KR920": 4, "IN865": 5, "RU864": 6}
@@ -392,10 +406,13 @@ def setup_lora(ntn_dongle, lora_conf, args):
             if parts:
                 otaa_by_index[parts[0]] = v
         for k, v in devices.items():
+            index = v.split(':')[0]
+            if int(index) >= node_count:
+                logger.warning(f'Skipping index {index}: exceeds max node count {node_count} for FW {fw_ver}')
+                continue
             logger.debug(f'AT+BISDEV={v}')
             data = ntn_dongle.pcie2_cmd('AT+BISDEV=' + v)
             logger.debug(f'response: {data}')
-            index = v.split(':')[0]
             if index in otaa_by_index:
                 if otaa_supported:
                     otaa_cmd = 'AT+BISOTAA=' + otaa_by_index[index]
@@ -406,7 +423,7 @@ def setup_lora(ntn_dongle, lora_conf, args):
                     logger.warning(f'Skipping OTAA for index {index}: FW {fw_ver} < V1.3.0')
 
     if args.lora_node_cleanup:
-        for i in range(16):
+        for i in range(node_count):
             cmd = f'AT+BISDEV={i}:ffffffff:ffffffffffffffffffffffffffffffff:ffffffffffffffffffffffffffffffff'
             data = ntn_dongle.pcie2_cmd(cmd)
             logger.info(f'response: {data}')
@@ -449,8 +466,14 @@ def _ver_tuple(ver_str):
         return (0, 0, 0)
 
 
+def get_max_node_count(ver_str):
+    """31 nodes (slots 0-30) for FW >= V1.3.2, else 16 nodes (slots 0-15)."""
+    return 31 if ver_str is not None and _ver_tuple(ver_str) >= (1, 3, 2) else 16
+
+
 def lora_node_query(ntn_dongle):
-    """Query and log LoRa node keys (private keys and OTAA EUI) for all 16 slots."""
+    """Query and log LoRa node keys (private keys and OTAA EUI) for all supported slots
+    (31 slots for FW >= V1.3.2, else 16 slots)."""
     version = get_lora_fw_ver(ntn_dongle)
     if version:
         logger.info(f'LoRa module version: {version}')
@@ -458,7 +481,9 @@ def lora_node_query(ntn_dongle):
         logger.error('LoRa version query failed')
 
     otaa_supported = version is not None and _ver_tuple(version) >= (1, 3, 0)
-    for i in range(16):
+    node_count = get_max_node_count(version)
+    logger.info(f'Max node count: {node_count}')
+    for i in range(node_count):
         cmd = f'AT+BISDEV={i}?'
         data = ntn_dongle.pcie2_cmd(cmd)
         if data:
