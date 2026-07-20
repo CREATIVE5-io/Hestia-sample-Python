@@ -7,7 +7,6 @@ Python scripts for testing and controlling NTN (Non-Terrestrial Network) modems 
 | File | Purpose |
 |------|---------|
 | `ntn_modbus_master_sample.py` | Main script — NIDD/UDP testing, uplink/downlink, LoRa provisioning, UDP device config |
-| `ntn_modbus_to_atCmd.py` | Standalone AT command passthrough utility |
 
 ## Features
 
@@ -17,7 +16,7 @@ Python scripts for testing and controlling NTN (Non-Terrestrial Network) modems 
 - Supports NIDD and UDP protocol modes
 - Configures UDP network parameters (remote IP, port, APN, local port) via `--ntn_config`
 - Optional downlink data reading in a separate thread
-- Optional uplink data transmission (signal metrics and/or GPS) with configurable packet types
+- Optional uplink data transmission (signal metrics, GPS, and/or a UAV MAVLink-telemetry sample) with configurable packet types
 - LoRa co-module (A2 hardware) key provisioning (ABP private keys + OTAA EUI) and AT command passthrough
 - Configurable status loop interval via `--interval`
 - Thread-safe Modbus communication using a port lock
@@ -50,10 +49,14 @@ python ntn_modbus_master_sample.py [options]
 | `--type` | Protocol mode: `NIDD` or `UDP` | `UDP` |
 | `--port` | Serial port | `/dev/ttyUSB0` |
 | `--upload` | Enable uplink data transmission | `False` |
-| `--ud_type` | Upload data type: `signal`, `gps`, or `all` | `all` |
+| `--ud_type` | Upload data type: `signal`, `gps`, `uav`, or `all` (`all` = signal+gps; `uav` must be selected explicitly) | `all` |
 | `--ud_data` | Raw upload data string sent as-is; overrides `--ud_type`, implies `--upload` | `None` |
+| `--uav_data` | JSON object overriding individual `uav` fields; unspecified fields use sample defaults | `None` |
+| `--ud_size` | Pad upload payload to this many bytes with repeating `1234567890` fill (`0` = no padding) | `0` |
+| `--ud_fill` | Send exactly `--ud_size` bytes of repeating `1234567890`, no other data; implies `--upload` (uses `150` if `--ud_size` is `0`) | `False` |
 | `--dl` | Enable downlink reading in a separate thread | `False` |
 | `--interval` | Status loop interval in seconds | `600` |
+| `--log_file` | Log file path; set to `''` to disable file logging | `ntn_modbus.log` |
 
 ### UDP device config options
 
@@ -81,6 +84,34 @@ Require `lora.ini` in the same directory. Auto-created with defaults if missing.
 | `--lora_pubkey_setup` | Write public key from `lora.ini` to device | `False` |
 | `--lora_pubkey_cleanup` | Wipe public key | `False` |
 
+### UAV Uplink Payload (`--ud_type uav`)
+
+The dongle has no direct MAVLink connection, so `uav` sends a MAVLink-derived telemetry sample rather than live-read register data (unlike `signal`/`gps`). Field values default to a fixed example set; `ts_unix_s` is always recomputed to the current time unless overridden via `--uav_data`.
+
+| idx | field | unit | default | note |
+|---|---|---|---|---|
+| 0 | `"uav"` | — | `"uav"` | fixed type tag |
+| 1 | `ts_unix_s` | s | current time | UNIX seconds; override via `--uav_data '{"ts_unix_s": ...}'` |
+| 2 | `mode_id` | enum | `5` | flight mode |
+| 3 | `landed_state` | enum | `2` | landed/in-air state |
+| 4 | `system_status` | enum | `4` | system status |
+| 5 | `lat_e7` | degE7 | `231067201` | latitude |
+| 6 | `lon_e7` | degE7 | `1202108074` | longitude |
+| 7 | `rel_alt_dm` | dm | `199` | relative altitude |
+| 8 | `heading_deg10` | 0.1° | `629` | heading |
+| 9 | `gspeed_dms` | 0.1 m/s | `10` | ground speed |
+| 10 | `bat_voltage_cV` | 0.01V | `1418` | battery voltage |
+| 11 | `bat_current_cA` | 0.01A | `865` | battery current |
+| 12 | `gps_fix_type` | enum | `4` | GPS fix type |
+| 13 | `mission_pct` | % | `56` | mission progress; `255` = invalid |
+
+Default payload:
+```json
+{"D":[{"mv":["uav",1776657541,5,2,4,231067201,1202108074,199,629,10,1418,865,4,56]}]}
+```
+
+Use `--uav_data` to override any subset of fields by name (indices 2–13, plus `ts_unix_s`); unlisted fields keep their default.
+
 ### Examples
 
 ```bash
@@ -93,6 +124,13 @@ python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ud_data '{"c":[42,-80]}
 # NIDD mode, upload signal data only
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --type NIDD --upload --ud_type signal
 
+# Send the default UAV telemetry sample payload
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --ud_type uav
+
+# Override specific uav fields, keep the rest as sample defaults
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --ud_type uav \
+    --uav_data '{"mode_id":3,"lat_e7":231067300,"mission_pct":80}'
+
 # Configure UDP network parameters (one-shot)
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ntn_config \
     --remote_port 55001 --apn my.apn.example --ip 1.2.3.4 --local_port 55002
@@ -102,6 +140,15 @@ python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --lora_setup --lora_node_
 
 # Query all 16 LoRa node key slots (private keys + OTAA EUI)
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --lora_node_query
+
+# Pad every upload payload out to 150 bytes for consistent-size testing
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --ud_type signal --ud_size 150
+
+# Send exactly 150 bytes of repeating filler, no JSON payload
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ud_fill --ud_size 150
+
+# Run without writing to a log file
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --log_file ''
 
 # Raw AT command passthrough (no full device setup flow)
 python ntn_modbus_to_atCmd.py --port /dev/ttyUSB0

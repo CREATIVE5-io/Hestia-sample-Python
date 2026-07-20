@@ -18,18 +18,37 @@ import modbus_tk.defines as cst
 import modbus_tk.modbus_rtu as modbus_rtu
 import serial
 
+# === UAV uplink sample payload ===
+# Fixed field order and PDF-example default values for --ud_type uav
+# (see UAV_資料格式建議_V02_20260421(Kevin).pdf, last page); --uav_data overrides a subset.
+UAV_FIELD_ORDER = ['mode_id', 'landed_state', 'system_status', 'lat_e7', 'lon_e7',
+                   'rel_alt_dm', 'heading_deg10', 'gspeed_dms', 'bat_voltage_cV',
+                   'bat_current_cA', 'gps_fix_type', 'mission_pct']
+UAV_DEFAULTS = {
+    'mode_id': 5, 'landed_state': 2, 'system_status': 4,
+    'lat_e7': 231067201, 'lon_e7': 1202108074, 'rel_alt_dm': 199,
+    'heading_deg10': 629, 'gspeed_dms': 10, 'bat_voltage_cV': 1418,
+    'bat_current_cA': 865, 'gps_fix_type': 4, 'mission_pct': 56,
+}
+
 # === Argument Parsing ===
 def parse_arguments():
     parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST")
     parser.add_argument("--type", type=str, help="Specify NIDD or UDP (default: UDP)", default='UDP')
     parser.add_argument("--port", type=str, help="Specify port (default: /dev/ttyUSB0)", default='/dev/ttyUSB0')
     parser.add_argument("--upload", action='store_true', help="Enable upload test (default: False)", default=False)
-    parser.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'all'], default='all',
-                        help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, 'all' for both (default: all)")
+    parser.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'uav', 'all'], default='all',
+                        help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, "
+                             "'uav' for a MAVLink-derived UAV telemetry sample, 'all' for signal+gps (default: all)")
     parser.add_argument("--ud_data", type=str, default=None,
                         help="Raw upload data string sent as-is; overrides --ud_type and implies --upload (default: None)")
-    parser.add_argument("--ud_size", type=int, default=150,
-                        help="Pad upload payload to this many bytes with '1234567890' fill (0=no padding, default: 150)")
+    parser.add_argument("--uav_data", type=str, default=None,
+                        help="JSON object overriding uav fields (mode_id, landed_state, system_status, lat_e7, "
+                             "lon_e7, rel_alt_dm, heading_deg10, gspeed_dms, bat_voltage_cV, bat_current_cA, "
+                             "gps_fix_type, mission_pct, ts_unix_s); unspecified fields use sample defaults "
+                             "(default: None)")
+    parser.add_argument("--ud_size", type=int, default=0,
+                        help="Pad upload payload to this many bytes with '1234567890' fill (0=no padding, default: 0)")
     parser.add_argument("--ud_fill", action='store_true', default=False,
                         help="Send exactly --ud_size bytes of repeating '1234567890', no other data; implies --upload")
     parser.add_argument("--dl", action='store_true', help="Enable downlink test (default: False)", default=False)
@@ -620,6 +639,20 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                                 gps_list.append(float(long))
                         if gps_list:
                             raw_packets.append({'g': gps_list})
+
+                    if args.ud_type == 'uav':
+                        uav_fields = dict(UAV_DEFAULTS)
+                        ts_override = None
+                        if args.uav_data:
+                            try:
+                                overrides = json.loads(args.uav_data)
+                                ts_override = overrides.pop('ts_unix_s', None)
+                                uav_fields.update(overrides)
+                            except json.JSONDecodeError as e:
+                                logger.error(f'Invalid --uav_data JSON: {e}')
+                        ts_unix_s = ts_override if ts_override is not None else int(time())
+                        uav_values = [ts_unix_s] + [uav_fields[f] for f in UAV_FIELD_ORDER]
+                        raw_packets.append({'D': [{'mv': ['uav'] + uav_values}]})
 
                 if not args.ud_fill:
                     for data in raw_packets:
