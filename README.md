@@ -54,6 +54,7 @@ python ntn_modbus_master_sample.py [options]
 | `--uav_data` | JSON object overriding individual `uav` fields; unspecified fields use sample defaults | `None` |
 | `--ud_size` | Pad upload payload to this many bytes with repeating `1234567890` fill (`0` = no padding) | `0` |
 | `--ud_fill` | Send exactly `--ud_size` bytes of repeating `1234567890`, no other data; implies `--upload` (uses `150` if `--ud_size` is `0`) | `False` |
+| `--no_ack` | Skip waiting on `0xF060`/`0xF061` after upload, for dongle firmware that never sends an uplink ACK (older firmware only — the wait loop blocks forever otherwise) | `False` |
 | `--dl` | Enable downlink reading in a separate thread | `False` |
 | `--interval` | Status loop interval in seconds | `600` |
 | `--log_file` | Log file path; set to `''` to disable file logging | `ntn_modbus.log` |
@@ -146,6 +147,9 @@ python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --ud_type signal
 
 # Send exactly 150 bytes of repeating filler, no JSON payload
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ud_fill --ud_size 150
+
+# Upload on firmware that never sends an uplink ACK
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --upload --ud_type signal --no_ack
 
 # Run without writing to a log file
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --log_file ''

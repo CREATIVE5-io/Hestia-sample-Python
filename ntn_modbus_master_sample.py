@@ -51,6 +51,8 @@ def parse_arguments():
                         help="Pad upload payload to this many bytes with '1234567890' fill (0=no padding, default: 0)")
     parser.add_argument("--ud_fill", action='store_true', default=False,
                         help="Send exactly --ud_size bytes of repeating '1234567890', no other data; implies --upload")
+    parser.add_argument("--no_ack", action='store_true', default=False,
+                        help="Dongle firmware does not send an uplink ACK; skip waiting on 0xF060/0xF061 after upload (default: False, waits for ACK)")
     parser.add_argument("--dl", action='store_true', help="Enable downlink test (default: False)", default=False)
     parser.add_argument("--interval", type=int, help="Status loop interval in seconds (default: 600)", default=600)
     # UDP device config
@@ -583,7 +585,7 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                         if not response:
                             break
                     logger.info(f'response: {response}')
-                    if response:
+                    if response and not args.no_ack:
                         while True:
                             data_len = ntn_dongle.read_register(0xF060)
                             if data_len != 0:
@@ -683,7 +685,7 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                             if not response:
                                 break
                         logger.info(f'response: {response}')
-                        if response:
+                        if response and not args.no_ack:
                             while True:
                                 data_len = ntn_dongle.read_register(0xF060)
                                 if data_len != 0:
