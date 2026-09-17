@@ -85,6 +85,7 @@ class ntn_modbus_master:
             self.master.set_verbose(False)
             self.slaveAddr = slaveAddress
             self.lock = threading.Lock()
+            self.lora_fmt = None
             logger.info('NTN dongle init!')
         except modbus_tk.modbus.ModbusError as e:
             logger.error(f'{e} - Code={e.get_exception_code()}')
@@ -191,9 +192,22 @@ class ntn_modbus_master:
             logger.info(e)
             return False
 
+    def get_lora_fmt(self):
+        """Query the LoRa BIS format (AT+BISFMT=?), cache it, and return it as an int."""
+        data = self.pcie2_cmd('AT+BISFMT=?')
+        if not data:
+            return None
+        try:
+            self.lora_fmt = int(re.split(r'[:\s\n]+', data)[2])
+        except (IndexError, ValueError):
+            return None
+        return self.lora_fmt
+
     def pcie2_cmd(self, cmd):
         """Send an AT command to the PCIe2 (LoRa) module and return the decoded response."""
         if cmd == 'AT+BISGET=?':
+            if self.lora_fmt is None:
+                self.get_lora_fmt()
             reg_data_len = 0xF460
             reg_data_start = 0xF461
         else:
@@ -221,11 +235,16 @@ class ntn_modbus_master:
                 a_codes.append(d >> 8)
                 a_codes.append(d & 0xFF)
             if cmd == 'AT+BISGET=?':
-                idx_1st = a_codes.index(34)
-                idx_2nd = a_codes.index(34, idx_1st + 1)
-                a_codes = a_codes[idx_1st + 1:idx_2nd]
+                if self.lora_fmt == 1:
+                    idx_1st = a_codes.index(34)
+                    idx_2nd = a_codes.index(34, idx_1st + 1)
+                    a_codes = a_codes[idx_1st + 1:idx_2nd]
                 logger.debug(f'a_codes: {a_codes}')
-                return binascii.unhexlify(bytes(a_codes)).decode('utf8')
+                try:
+                    return binascii.unhexlify(bytes(a_codes)).decode('utf8')
+                except binascii.Error:
+                    pass
+                return bytes(a_codes).decode('utf8')
             else:
                 logger.debug(f'a_codes: {a_codes}')
                 return bytes(a_codes).decode('utf8')
