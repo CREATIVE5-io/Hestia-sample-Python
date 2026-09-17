@@ -61,6 +61,20 @@ def parse_arguments():
     parser.add_argument("--apn", type=str, help="Specify APN", default='')
     parser.add_argument("--ip", type=str, help="Specify remote IP", default='')
     parser.add_argument("--local_port", type=str, help="Specify local port", default='')
+    # NTN/TN module command channel (0x9C40, Nordic nRF9151 modem only)
+    parser.add_argument("--network_registration_status", action='store_true', default=False,
+                        help="Nordic nRF9151 modem only. One-shot: query network registration status "
+                             "(AT+CEREG?) via the NTN/TN module command channel (0x9C40), then exit")
+    parser.add_argument("--leo_config", action='store_true', default=False,
+                        help="Nordic nRF9151 modem only. Configure LEO target satellite (SET_TARGET_ID) "
+                             "and orbit (SET_TLE) via 0x9C40; requires --tle_file")
+    parser.add_argument("--tle_file", type=str, default=None,
+                        help="3-line TLE file (SATELIOT_<id> name, TLE line1, TLE line2) for --leo_config")
+    parser.add_argument("--ntn_trigger", type=str, choices=['sgp4', 'gnss', 'tn', 'ntn'], default=None,
+                        help="Nordic nRF9151 modem only. Trigger network mode via 0x9C40: 'sgp4'=LEO "
+                             "tracking, 'gnss'=GNSS fix, 'tn'=terrestrial, 'ntn'=GEO satellite. Before "
+                             "triggering 'ntn', trigger 'gnss' first and confirm the GPS location "
+                             "(0xEB1B/0xEB20) has updated")
     # LoRa (A2 hardware)
     parser.add_argument("--lora", action='store_true', help="Enable LoRa data polling in status loop (default: False)", default=False)
     parser.add_argument("--lora_setup", action='store_true', help="Enable LoRa module setup", default=False)
@@ -191,6 +205,11 @@ class ntn_modbus_master:
         except Exception as e:
             logger.info(e)
             return False
+
+    def ntn_cmd(self, cmd):
+        """Write an ASCII command + CRLF to the NTN/TN module command channel (0x9C40)."""
+        ascii_cmd = self._at_command_to_ascii(cmd + '\r\n')
+        return self.set_registers(0x9C40, ascii_cmd)
 
     def get_lora_fmt(self):
         """Query the LoRa BIS format (AT+BISFMT=?), cache it, and return it as an int."""
@@ -332,6 +351,88 @@ class LoraConfig:
 
     def get_otaa_eui(self):
         return dict(self.config['OTAA_EUI']) if 'OTAA_EUI' in self.config else {}
+
+
+def ntn_cmd_reply(ntn_dongle, timeout_s=5):
+    """Poll 0xF060 (reply length) then read 0xF061 (reply data) after an
+    NTN/TN command-channel (0x9C40) write; same reply registers as uplink."""
+    deadline = time() + timeout_s
+    while time() < deadline:
+        data_len = ntn_dongle.read_register(0xF060)
+        if data_len:
+            data_resp = ntn_dongle.read_registers(0xF061, data_len)
+            return ntn_modbus_master.modbus_data_to_string(data_resp) if data_resp else None
+        sleep(1)
+    return None
+
+
+SATELIOT_NAME_RE = re.compile(r'^SATELIOT_(\d+)$', re.IGNORECASE)
+
+
+def parse_tle_file(path):
+    """Parse a 3-line TLE file (name, line1, line2) for --leo_config.
+    Target ID is parsed from the name; only 'SATELIOT_<id>' is supported."""
+    with open(path, encoding='ascii', errors='replace') as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    if len(lines) < 3:
+        raise ValueError(f'TLE file requires at least 3 lines (name + line1 + line2), got {len(lines)}')
+    name, line1, line2 = lines[0], lines[1], lines[2]
+    m = SATELIOT_NAME_RE.match(name)
+    if not m:
+        raise ValueError(f"Unsupported satellite name '{name}': only 'SATELIOT_<id>' is currently supported")
+    return int(m.group(1)), name, line1, line2
+
+
+def _ntn_cmd_unlock(ntn_dongle):
+    """Write the default password (Sequence 1 unlock), matching ntn_config()/ntn_info()."""
+    DEFAULT_PASSWD = '00000000'
+    passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
+    if not ntn_dongle.set_registers(0x0000, passwd):
+        logger.error('Password set failed')
+        return False
+    return True
+
+
+def network_registration_status(ntn_dongle):
+    """One-shot: AT+CEREG? via the NTN/TN module command channel (0x9C40), log the reply."""
+    if not _ntn_cmd_unlock(ntn_dongle):
+        return
+    if not ntn_dongle.ntn_cmd('AT+CEREG?'):
+        logger.error('AT+CEREG? command failed')
+        return
+    reply = ntn_cmd_reply(ntn_dongle)
+    logger.info(f'Network registration status: {reply}')
+
+
+def leo_config(ntn_dongle, tle_file):
+    """Parse --tle_file, then SET_TARGET_ID + SET_TLE over the 0x9C40 command channel."""
+    try:
+        target_id, name, line1, line2 = parse_tle_file(tle_file)
+    except (OSError, ValueError) as e:
+        logger.error(f'--leo_config failed: {e}')
+        return
+    if not _ntn_cmd_unlock(ntn_dongle):
+        return
+    if not ntn_dongle.ntn_cmd(f'SET_TARGET_ID {target_id}'):
+        logger.error('SET_TARGET_ID failed')
+        return
+    logger.info(f'SET_TARGET_ID {target_id} sent')
+    if not ntn_dongle.ntn_cmd(f'SET_TLE "{name}" "{line1}" "{line2}"'):
+        logger.error('SET_TLE failed')
+        return
+    logger.info(f'SET_TLE "{name}" sent')
+
+
+def ntn_trigger(ntn_dongle, which):
+    """Trigger LEO(sgp4) / GNSS / TN / GEO(ntn) mode via the 0x9C40 command channel."""
+    cmd_map = {'sgp4': 'SGP4_TRIGGER', 'gnss': 'GNSS_TRIGGER', 'tn': 'TN_TRIGGER', 'ntn': 'NTN_TRIGGER'}
+    cmd = cmd_map[which]
+    if not _ntn_cmd_unlock(ntn_dongle):
+        return
+    if ntn_dongle.ntn_cmd(cmd):
+        logger.info(f'{cmd} sent')
+    else:
+        logger.error(f'{cmd} failed')
 
 
 def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str = None):
@@ -756,6 +857,10 @@ def main():
             logger.info('NTN dongle configured successfully.')
             logger.info('Please unplug the NTN dongle and plug it back in to apply new settings.')
             return
+        # One-shot network registration status query (AT+CEREG? via 0x9C40)
+        if args.network_registration_status:
+            network_registration_status(ntn_dongle)
+            return
         ntn_info(ntn_dongle, args)
         # LoRa setup (A2 hardware)
         if any([args.lora_setup, args.lora_node_cleanup, args.lora_node_setup,
@@ -763,6 +868,14 @@ def main():
             setup_lora(ntn_dongle, lora_conf, args)
         if args.lora_node_query:
             lora_node_query(ntn_dongle)
+        # LEO target/orbit config and network mode trigger (0x9C40, nRF9151 firmware)
+        if args.leo_config:
+            if not args.tle_file:
+                logger.error('Please provide --tle_file for --leo_config.')
+                sys.exit(1)
+            leo_config(ntn_dongle, args.tle_file)
+        if args.ntn_trigger:
+            ntn_trigger(ntn_dongle, args.ntn_trigger)
         ntn_status_loop(ntn_dongle, args, lora_conf)
     except Exception as e:
         logger.error(f'{e}')

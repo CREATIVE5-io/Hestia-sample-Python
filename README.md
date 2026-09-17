@@ -18,6 +18,7 @@ Python scripts for testing and controlling NTN (Non-Terrestrial Network) modems 
 - Optional downlink data reading in a separate thread
 - Optional uplink data transmission (signal metrics, GPS, and/or a UAV MAVLink-telemetry sample) with configurable packet types
 - LoRa co-module (A2 hardware) key provisioning (ABP private keys + OTAA EUI) and AT command passthrough
+- NTN/TN module command channel (`--network_registration_status`, `--leo_config`, `--ntn_trigger`) — **only supported on the Nordic nRF9151 modem**
 - Configurable status loop interval via `--interval`
 - Thread-safe Modbus communication using a port lock
 
@@ -70,6 +71,23 @@ Used with `--ntn_config` to write network parameters to the device (one-shot, ex
 | `--apn` | APN string | `''` |
 | `--ip` | Remote server IP address | `''` |
 | `--local_port` | Local port (optional) | `''` (defaults to `55001` if omitted) |
+
+### NTN/TN module command options (0x9C40)
+
+> **Nordic nRF9151 modem only.** `--network_registration_status`, `--leo_config`, and `--ntn_trigger` talk to the `0x9C40` module command channel introduced by the Nordic nRF9151 modem firmware; they are not supported on other dongle modems.
+
+Each of these is a one-shot action; `--leo_config` and `--ntn_trigger` then continue on into the normal status loop (they run before `ntn_status_loop`), while `--network_registration_status` exits immediately after logging the result.
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--network_registration_status` | Query network registration status (`AT+CEREG?`), log the reply, then exit | `False` |
+| `--leo_config` | Configure LEO target satellite (`SET_TARGET_ID`) and orbit (`SET_TLE`); requires `--tle_file` | `False` |
+| `--tle_file` | 3-line TLE file for `--leo_config`: line 1 is the satellite name (only `SATELIOT_<id>` is supported; the target ID is parsed from it), lines 2–3 are the TLE | `None` |
+| `--ntn_trigger` | Trigger network mode: `sgp4` (LEO tracking), `gnss` (GNSS fix), `tn` (terrestrial), `ntn` (GEO satellite) | `None` |
+
+**Getting TLE data:** [n2yo.com](https://www.n2yo.com/) provides up-to-date TLE data for tracked satellites — look up the target satellite there, copy its two TLE lines into `--tle_file` (line 1 must still be renamed to `SATELIOT_<id>` for `parse_tle_file()` to accept it).
+
+**NTN trigger workflow:** before triggering `ntn` (GEO), first trigger `gnss` and confirm the device has an updated GPS fix — check Latitude/Longitude (`0xEB1B`/`0xEB20`, logged at startup by `ntn_info()`, or uploaded via `--ud_type gps`) has actually changed/updated — then trigger `ntn`.
 
 ### LoRa options (A2 hardware)
 
@@ -156,6 +174,20 @@ python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --log_file ''
 
 # Raw AT command passthrough (no full device setup flow)
 python ntn_modbus_to_atCmd.py --port /dev/ttyUSB0
+
+# Query network registration status (Nordic nRF9151 modem only)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --network_registration_status
+
+# Configure LEO target satellite + orbit from a 3-line TLE file (Nordic nRF9151 modem only)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --leo_config --tle_file tle.txt
+
+# Trigger LEO / terrestrial network mode (Nordic nRF9151 modem only)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ntn_trigger sgp4   # LEO
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ntn_trigger tn     # terrestrial
+
+# Trigger GEO (ntn): first trigger gnss and confirm GPS location has updated, then trigger ntn
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ntn_trigger gnss   # confirm Latitude/Longitude updates before continuing
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --ntn_trigger ntn    # GEO
 ```
 
 ## LoRa Configuration (`lora.ini`)
@@ -212,10 +244,11 @@ pubkey = <hex_key>:<hex_key>
 | `0xC3D5` | R/W | UDP local port |
 | `0xC550` | W | Uplink data write |
 | `0xC700+` | W | LoRa AT command write |
+| `0x9C40` | W | NTN/TN module command channel (ASCII + CRLF; CEREG/SET_TARGET_ID/SET_TLE/triggers — **Nordic nRF9151 modem only**) |
 | `0xEC60` | R | Downlink data length |
 | `0xEC61+` | R | Downlink data |
-| `0xF060` | R | Uplink response length |
-| `0xF061+` | R | Uplink response data |
+| `0xF060` | R | Uplink response length (also used for 0x9C40 NTN/TN command replies) |
+| `0xF061+` | R | Uplink response data (also used for 0x9C40 NTN/TN command replies) |
 | `0xF460` | R | `AT+BISGET=?` response length |
 | `0xF461+` | R | `AT+BISGET=?` response data |
 | `0xF860` | R | General AT response length |
