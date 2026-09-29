@@ -2,6 +2,7 @@
 import argparse
 import binascii
 import configparser
+import csv
 import json
 import logging
 import logging.handlers
@@ -30,6 +31,24 @@ UAV_DEFAULTS = {
     'heading_deg10': 629, 'gspeed_dms': 10, 'bat_voltage_cV': 1418,
     'bat_current_cA': 865, 'gps_fix_type': 4, 'mission_pct': 56,
 }
+
+# === nRF9151 status query commands (NTN_STATUS_SPEC.md §3) ===
+# Command -> reply field names, in reply order ('!<CMD>: f1,f2,...\r\n\r\nOK\r\n').
+NTN_QUERY_FIELDS = {
+    'NSTATE': ['state', 'exit_reason', 'registered', 'sock_open'],
+    'NCHECK': ['bitmap'],
+    'NGNSS': ['fix_status', 'lat', 'lon', 'alt', 'accuracy', 'valid_until'],
+    'NSIGNAL': ['rsrp', 'sinr', 'rsrq', 'band', 'earfcn', 'pci', 'cellid', 'tac'],
+    'NREG': ['cereg_stat', 'ip', 'sock', 'mo_sent', 'mt_rcvd'],
+    'NMO': ['queue_depth', 'queue_bytes', 'mo_sent_count', 'last_sent_ts'],
+    'NTLE': ['num_sats', 'target_id', 'valid', 'dirty', 'aos', 'los'],
+    'NCFG': ['apn', 'udp_ip', 'port', 'bind', 'pdp'],
+    'NVER': ['app_version', 'zephyr', 'modem_fw', 'provider'],
+    'NERR': ['exit_reason', 'ceer', 'fail_cnt', 'rrc_idle'],
+}
+# NCHECK bitmap bit -> meaning
+NCHECK_BITS = ['module_ready', 'sim_ready', 'provider_resolved', 'gnss_fix_valid',
+               'tle_valid', 'ntn_registered', 'socket_open', 'mo_queue_pending']
 
 # === Argument Parsing ===
 def parse_arguments():
@@ -75,6 +94,15 @@ def parse_arguments():
                              "tracking, 'gnss'=GNSS fix, 'tn'=terrestrial, 'ntn'=GEO satellite. Before "
                              "triggering 'ntn', trigger 'gnss' first and confirm the GPS location "
                              "(0xEB1B/0xEB20) has updated")
+    parser.add_argument("--ntn_query", type=str.upper, nargs='+', choices=list(NTN_QUERY_FIELDS) + ['ALL'],
+                        default=None, metavar='CMD',
+                        help="Nordic nRF9151 modem only. Send status query command(s) via 0x9C40 "
+                             "(NTN_STATUS_SPEC §3) each status loop iteration, before uplink, and log "
+                             "the parsed replies. "
+                             f"Choices (case-insensitive): {', '.join(NTN_QUERY_FIELDS)}, ALL")
+    parser.add_argument("--ntn_query_once", action='store_true', default=False,
+                        help="With --ntn_query: one-shot mode, run the queries once and exit "
+                             "instead of each status loop iteration")
     # LoRa (A2 hardware)
     parser.add_argument("--lora", action='store_true', help="Enable LoRa data polling in status loop (default: False)", default=False)
     parser.add_argument("--lora_setup", action='store_true', help="Enable LoRa module setup", default=False)
@@ -435,6 +463,51 @@ def ntn_trigger(ntn_dongle, which):
         logger.error(f'{cmd} failed')
 
 
+def parse_ntn_query_reply(cmd, reply):
+    """Parse '!<CMD>: v1,v2,...\r\n\r\nOK\r\n' into {field: value}.
+    Returns 'NONE' for a no-data reply, None if the reply is missing/ERROR/unrecognized."""
+    if not reply:
+        return None
+    m = re.search(rf'!{cmd}:\s*(.*?)\s*(?:\r?\n|$)', reply)
+    if not m:
+        return None
+    body = m.group(1)
+    if body == 'NONE':
+        return 'NONE'
+    values = next(csv.reader([body], skipinitialspace=True))
+    fields = NTN_QUERY_FIELDS[cmd]
+    if len(values) != len(fields):
+        logger.warning(f'{cmd}: expected {len(fields)} fields, got {len(values)}: {values}')
+    parsed = dict(zip(fields, values))
+    if cmd == 'NCHECK' and 'bitmap' in parsed:
+        try:
+            bits = int(parsed['bitmap'], 16)
+            parsed.update({name: (bits >> i) & 1 for i, name in enumerate(NCHECK_BITS)})
+        except ValueError:
+            pass
+    return parsed
+
+
+def ntn_query(ntn_dongle, cmds):
+    """Send NTN_STATUS_SPEC §3 query command(s) via 0x9C40, log raw + parsed replies.
+    Called once from main() with --ntn_query_once, else from ntn_status_loop() before uplink, since replies share 0xF060/0xF061 with the uplink ACK."""
+    if 'ALL' in cmds:
+        cmds = list(NTN_QUERY_FIELDS)
+    if not _ntn_cmd_unlock(ntn_dongle):
+        return
+    for cmd in dict.fromkeys(cmds):
+        if not ntn_dongle.ntn_cmd(cmd):
+            logger.error(f'{cmd} command failed')
+            continue
+        reply = ntn_cmd_reply(ntn_dongle)
+        logger.info(f'{cmd} reply: {reply!r}')
+        parsed = parse_ntn_query_reply(cmd, reply)
+        if parsed is None:
+            logger.error(f'{cmd}: no valid reply')
+        else:
+            logger.info(f'{cmd}: {parsed}')
+
+
 def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str = None):
     """One-shot: authenticate then write UDP network parameters to device registers."""
     DEFAULT_PASSWD = '00000000'
@@ -477,6 +550,8 @@ def ntn_info(ntn_dongle, args):
     def log_reg(desc, resp):
         if resp:
             logger.info(f'{desc}: {ntn_modbus_master.modbus_data_to_string(resp)}')
+        else:
+            logger.info(f'{desc}: {resp}')
 
     if args.type == 'UDP':
         log_reg('remote port', ntn_dongle.read_registers(0xC3B8, 3, functioncode=3))
@@ -643,7 +718,7 @@ def lora_node_query(ntn_dongle):
 
 
 def ntn_status_loop(ntn_dongle, args, lora_conf):
-    """Main status loop: poll NTN status, upload telemetry, poll LoRa, then sleep --interval seconds.
+    """Main status loop: poll NTN status, run --ntn_query, upload telemetry, poll LoRa, then sleep --interval seconds.
     The interval is wall-clock based: sleep time = interval - elapsed work time."""
     while True:
         t_start = time()
@@ -678,6 +753,11 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                     net_status = True
             else:
                 logger.error(f'Wrong NTN type: {args.type}')
+
+        # nRF9151 status queries (0x9C40); must finish before uplink, which reuses 0xF060/0xF061
+        if args.ntn_query:
+            logger.info('=== nRF9151 status query ===')
+            ntn_query(ntn_dongle, args.ntn_query)
 
         avbl = ntn_dongle.read_register(0xEA7D)
         logger.info(f'{avbl=}')
@@ -860,6 +940,13 @@ def main():
         # One-shot network registration status query (AT+CEREG? via 0x9C40)
         if args.network_registration_status:
             network_registration_status(ntn_dongle)
+            return
+        # One-shot nRF9151 status query (--ntn_query --ntn_query_once)
+        if args.ntn_query_once:
+            if not args.ntn_query:
+                logger.error('Please provide --ntn_query for --ntn_query_once.')
+                sys.exit(1)
+            ntn_query(ntn_dongle, args.ntn_query)
             return
         ntn_info(ntn_dongle, args)
         # LoRa setup (A2 hardware)
