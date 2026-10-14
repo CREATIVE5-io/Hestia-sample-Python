@@ -32,7 +32,7 @@ UAV_DEFAULTS = {
     'bat_current_cA': 865, 'gps_fix_type': 4, 'mission_pct': 56,
 }
 
-# === nRF9151 status query commands (NTN_STATUS_SPEC.md §3) ===
+# === nRF9151 status query commands (NTN_STATUS_SPEC.md §3, plus NEXTPASS from LEO_VERSION_OPERATION.md §8.2) ===
 # Command -> reply field names, in reply order ('!<CMD>: f1,f2,...\r\n\r\nOK\r\n').
 NTN_QUERY_FIELDS = {
     'NSTATE': ['state', 'exit_reason', 'registered', 'sock_open'],
@@ -45,6 +45,7 @@ NTN_QUERY_FIELDS = {
     'NCFG': ['apn', 'udp_ip', 'port', 'bind', 'pdp'],
     'NVER': ['app_version', 'zephyr', 'modem_fw', 'provider'],
     'NERR': ['exit_reason', 'ceer', 'fail_cnt', 'rrc_idle'],
+    'NEXTPASS': ['sat', 'aos', 'tca', 'los', 'max_el'],
 }
 # NCHECK bitmap bit -> meaning
 NCHECK_BITS = ['module_ready', 'sim_ready', 'provider_resolved', 'gnss_fix_valid',
@@ -97,7 +98,7 @@ def parse_arguments():
     parser.add_argument("--ntn_query", type=str.upper, nargs='+', choices=list(NTN_QUERY_FIELDS) + ['ALL'],
                         default=None, metavar='CMD',
                         help="Nordic nRF9151 modem only. Send status query command(s) via 0x9C40 "
-                             "(NTN_STATUS_SPEC §3) each status loop iteration, before uplink, and log "
+                             "(NTN_STATUS_SPEC §3, plus LEO NEXTPASS) each status loop iteration, before uplink, and log "
                              "the parsed replies. "
                              f"Choices (case-insensitive): {', '.join(NTN_QUERY_FIELDS)}, ALL")
     parser.add_argument("--ntn_query_once", action='store_true', default=False,
