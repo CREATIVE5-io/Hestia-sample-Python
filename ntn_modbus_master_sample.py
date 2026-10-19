@@ -11,6 +11,8 @@ import re
 import struct
 import sys
 import threading
+import urllib.parse
+import urllib.request
 from time import sleep, time
 
 # === Third-Party Imports ===
@@ -32,8 +34,9 @@ UAV_DEFAULTS = {
     'bat_current_cA': 865, 'gps_fix_type': 4, 'mission_pct': 56,
 }
 
-# === nRF9151 status query commands (NTN_STATUS_SPEC.md §3, plus NEXTPASS from LEO_VERSION_OPERATION.md §8.2) ===
+# === nRF9151 status query commands (NTN_STATUS_SPEC.md §3, plus NEXTPASS/MOBUF/SIB32 from LEO_VERSION_OPERATION.md §8.2) ===
 # Command -> reply field names, in reply order ('!<CMD>: f1,f2,...\r\n\r\nOK\r\n').
+# None = reply body kept whole as {'raw': body} (SIB32 ephemeris content may itself contain commas).
 NTN_QUERY_FIELDS = {
     'NSTATE': ['state', 'exit_reason', 'registered', 'sock_open'],
     'NCHECK': ['bitmap'],
@@ -46,74 +49,170 @@ NTN_QUERY_FIELDS = {
     'NVER': ['app_version', 'zephyr', 'modem_fw', 'provider'],
     'NERR': ['exit_reason', 'ceer', 'fail_cnt', 'rrc_idle'],
     'NEXTPASS': ['sat', 'aos', 'tca', 'los', 'max_el'],
+    'MOBUF': ['queue_depth'],
+    'SIB32': None,
 }
+# Query name -> wire command, where they differ ('MOBUF' alone would clear the queue).
+NTN_QUERY_WIRE_CMD = {'MOBUF': 'MOBUF?'}
+MOCOUNT_MAX = 100
+# CSQ/GPS read interval (holding register 0xC35B): --csq_gps_interval choice -> register value.
+# 'default' (0xFE) is the original ~0.9 s poll cycle; any other value returns Modbus exception 0x03.
+CSQ_GPS_INTERVAL_REG = 0xC35B
+CSQ_GPS_INTERVAL_VALUES = {'off': 0, '1': 1, '10': 2, '30': 3, '60': 4, 'default': 0xFE}
+CSQ_GPS_INTERVAL_DESC = {0: 'disabled', 1: '1 min', 2: '10 min', 3: '30 min', 4: '60 min', 0xFE: 'default (~0.9 s)'}
 # NCHECK bitmap bit -> meaning
 NCHECK_BITS = ['module_ready', 'sim_ready', 'provider_resolved', 'gnss_fix_valid',
                'tle_valid', 'ntn_registered', 'socket_open', 'mo_queue_pending']
 
 # === Argument Parsing ===
+HELP_EXAMPLES = """\
+Options marked "One-shot" run and exit. All other commands (--leo_config, --ntn_trigger,
+--mobuf*, LoRa setup/query) run first, then the script continues into the status loop
+(stop it with Ctrl+C).
+
+examples:
+  Status loop only (UDP firmware is the default; add --type NIDD for NIDD firmware):
+    %(prog)s --port /dev/ttyUSB0
+  Status loop + uplink of signal/GPS data + downlink thread, every 60 s:
+    %(prog)s --port /dev/ttyUSB0 --upload --dl --interval 60
+  Uplink a UAV telemetry sample, overriding one field:
+    %(prog)s --port /dev/ttyUSB0 --upload --ud_type uav --uav_data '{"mode_id":3}'
+  Write UDP network params (UDP firmware only; replug the dongle afterwards):
+    %(prog)s --port /dev/ttyUSB0 --ntn_config --ip 203.0.113.10 --remote_port 5000 --apn internet
+  Set the CSQ/GPS read interval to 10 min (or 'get' to read it back):
+    %(prog)s --port /dev/ttyUSB0 --csq_gps_interval 10
+
+  nRF9151 - configure LEO satellite from CelesTrak (or --tle_file tle.txt) and start LEO tracking:
+    %(prog)s --port /dev/ttyUSB0 --leo_config --tle_norad 60534 --ntn_trigger sgp4
+  nRF9151 - switch to GEO: trigger gnss, wait for the GPS location to update, Ctrl+C, then trigger ntn:
+    %(prog)s --port /dev/ttyUSB0 --ntn_trigger gnss
+    %(prog)s --port /dev/ttyUSB0 --ntn_trigger ntn
+  nRF9151 - run status queries once and exit:
+    %(prog)s --port /dev/ttyUSB0 --ntn_query nstate ncheck nextpass --ntn_query_once
+  nRF9151 - reload the auto-MO queue, send each payload 10x per pass, then verify:
+    %(prog)s --port /dev/ttyUSB0 --mobuf_clear --mobuf hello world --mocount 10 --ntn_query mobuf nmo --ntn_query_once
+
+  LoRa - configure the module and write node + public keys from lora.ini:
+    %(prog)s --port /dev/ttyUSB0 --lora_setup --lora_node_setup --lora_pubkey_setup
+  LoRa - read back node keys:
+    %(prog)s --port /dev/ttyUSB0 --lora_node_query
+"""
+
+
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST")
-    parser.add_argument("--type", type=str, help="Specify NIDD or UDP (default: UDP)", default='UDP')
-    parser.add_argument("--port", type=str, help="Specify port (default: /dev/ttyUSB0)", default='/dev/ttyUSB0')
-    parser.add_argument("--upload", action='store_true', help="Enable upload test (default: False)", default=False)
-    parser.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'uav', 'all'], default='all',
-                        help="Upload data type: 'signal' for RSRP/SINR, 'gps' for lat/long, "
-                             "'uav' for a MAVLink-derived UAV telemetry sample, 'all' for signal+gps (default: all)")
-    parser.add_argument("--ud_data", type=str, default=None,
-                        help="Raw upload data string sent as-is; overrides --ud_type and implies --upload (default: None)")
-    parser.add_argument("--uav_data", type=str, default=None,
-                        help="JSON object overriding uav fields (mode_id, landed_state, system_status, lat_e7, "
-                             "lon_e7, rel_alt_dm, heading_deg10, gspeed_dms, bat_voltage_cV, bat_current_cA, "
-                             "gps_fix_type, mission_pct, ts_unix_s); unspecified fields use sample defaults "
-                             "(default: None)")
-    parser.add_argument("--ud_size", type=int, default=0,
-                        help="Pad upload payload to this many bytes with '1234567890' fill (0=no padding, default: 0)")
-    parser.add_argument("--ud_fill", action='store_true', default=False,
-                        help="Send exactly --ud_size bytes of repeating '1234567890', no other data; implies --upload")
-    parser.add_argument("--no_ack", action='store_true', default=False,
-                        help="Dongle firmware does not send an uplink ACK; skip waiting on 0xF060/0xF061 after upload (default: False, waits for ACK)")
-    parser.add_argument("--dl", action='store_true', help="Enable downlink test (default: False)", default=False)
-    parser.add_argument("--interval", type=int, help="Status loop interval in seconds (default: 600)", default=600)
-    # UDP device config
-    parser.add_argument("--ntn_config", action='store_true', help="Configure NTN dongle UDP parameters, ONLY use this config in UDP version dongle firmware", default=False)
-    parser.add_argument("--remote_port", type=str, help="Specify remote port", default='')
-    parser.add_argument("--apn", type=str, help="Specify APN", default='')
-    parser.add_argument("--ip", type=str, help="Specify remote IP", default='')
-    parser.add_argument("--local_port", type=str, help="Specify local port", default='')
-    # NTN/TN module command channel (0x9C40, Nordic nRF9151 modem only)
-    parser.add_argument("--network_registration_status", action='store_true', default=False,
-                        help="Nordic nRF9151 modem only. One-shot: query network registration status "
-                             "(AT+CEREG?) via the NTN/TN module command channel (0x9C40), then exit")
-    parser.add_argument("--leo_config", action='store_true', default=False,
-                        help="Nordic nRF9151 modem only. Configure LEO target satellite (SET_TARGET_ID) "
-                             "and orbit (SET_TLE) via 0x9C40; requires --tle_file")
-    parser.add_argument("--tle_file", type=str, default=None,
-                        help="3-line TLE file (SATELIOT_<id> name, TLE line1, TLE line2) for --leo_config")
-    parser.add_argument("--ntn_trigger", type=str, choices=['sgp4', 'gnss', 'tn', 'ntn'], default=None,
-                        help="Nordic nRF9151 modem only. Trigger network mode via 0x9C40: 'sgp4'=LEO "
-                             "tracking, 'gnss'=GNSS fix, 'tn'=terrestrial, 'ntn'=GEO satellite. Before "
-                             "triggering 'ntn', trigger 'gnss' first and confirm the GPS location "
-                             "(0xEB1B/0xEB20) has updated")
-    parser.add_argument("--ntn_query", type=str.upper, nargs='+', choices=list(NTN_QUERY_FIELDS) + ['ALL'],
-                        default=None, metavar='CMD',
-                        help="Nordic nRF9151 modem only. Send status query command(s) via 0x9C40 "
-                             "(NTN_STATUS_SPEC §3, plus LEO NEXTPASS) each status loop iteration, before uplink, and log "
-                             "the parsed replies. "
-                             f"Choices (case-insensitive): {', '.join(NTN_QUERY_FIELDS)}, ALL")
-    parser.add_argument("--ntn_query_once", action='store_true', default=False,
-                        help="With --ntn_query: one-shot mode, run the queries once and exit "
-                             "instead of each status loop iteration")
-    # LoRa (A2 hardware)
-    parser.add_argument("--lora", action='store_true', help="Enable LoRa data polling in status loop (default: False)", default=False)
-    parser.add_argument("--lora_setup", action='store_true', help="Enable LoRa module setup", default=False)
-    parser.add_argument("--lora_node_query", action='store_true', help="Query LoRa node keys (private + OTAA EUI)", default=False)
-    parser.add_argument("--lora_node_setup", action='store_true', help="Setup LoRa node keys (private + OTAA EUI) from lora.ini", default=False)
-    parser.add_argument("--lora_node_cleanup", action='store_true', help="Cleanup all LoRa node keys (private + OTAA EUI)", default=False)
-    parser.add_argument("--lora_pubkey_setup", action='store_true', help="Setup LoRa public key from lora.ini", default=False)
-    parser.add_argument("--lora_pubkey_cleanup", action='store_true', help="Cleanup LoRa public key", default=False)
-    parser.add_argument("--log_file", type=str, default='ntn_modbus.log',
+    parser = argparse.ArgumentParser(description="NTN-MODBUS-MASTER-TEST", epilog=HELP_EXAMPLES,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = parser.add_argument_group(
+        "Common (TN / NTN LEO / NTN GEO)",
+        "Options supported by every dongle regardless of network mode.")
+    # Connection / status loop
+    common.add_argument("--port", type=str, default='/dev/ttyUSB0',
+                        help="Serial port (default: /dev/ttyUSB0)")
+    common.add_argument("--type", type=str.upper, choices=['NIDD', 'UDP'], default='UDP',
+                        help="Dongle firmware protocol (default: UDP)")
+    common.add_argument("--interval", type=int, default=600,
+                        help="Status loop interval in seconds (default: 600)")
+    common.add_argument("--log_file", type=str, default='ntn_modbus.log',
                         help="Log file path (default: ntn_modbus.log); set to '' to disable file logging")
+    # Uplink
+    common.add_argument("--upload", action='store_true', default=False,
+                        help="Uplink data each status loop iteration; content chosen by --ud_type")
+    common.add_argument("--ud_type", type=str, choices=['signal', 'gps', 'uav', 'all'], default='all',
+                        help="With --upload: 'signal'=RSRP/SINR, 'gps'=lat/long, 'uav'=UAV telemetry sample, "
+                             "'all'=signal+gps (default: all)")
+    common.add_argument("--uav_data", type=str, default=None, metavar='JSON',
+                        help="With --ud_type uav: JSON object overriding uav fields (mode_id, landed_state, "
+                             "system_status, lat_e7, lon_e7, rel_alt_dm, heading_deg10, gspeed_dms, "
+                             "bat_voltage_cV, bat_current_cA, gps_fix_type, mission_pct, ts_unix_s); "
+                             "unspecified fields use sample defaults")
+    common.add_argument("--ud_data", type=str, default=None, metavar='TEXT',
+                        help="Uplink this raw string as-is instead of --ud_type data; implies --upload")
+    common.add_argument("--ud_size", type=int, default=0, metavar='N',
+                        help="Pad the uplink payload to N bytes with '1234567890' fill (default: 0 = no padding)")
+    common.add_argument("--ud_fill", action='store_true', default=False,
+                        help="Uplink exactly --ud_size bytes of repeating '1234567890' (150 if --ud_size is 0), "
+                             "no other data; implies --upload")
+    common.add_argument("--no_ack", action='store_true', default=False,
+                        help="Don't wait for an uplink ACK on 0xF060/0xF061; use only with dongle firmware "
+                             "that never sends one")
+    # Downlink
+    common.add_argument("--dl", action='store_true', default=False,
+                        help="Read downlink data (0xEC60) in a background thread")
+    # One-shot UDP device config: --ntn_config + --remote_port/--apn/--ip[/--local_port]
+    common.add_argument("--ntn_config", action='store_true', default=False,
+                        help="UDP firmware only. One-shot: write --ip, --remote_port, --apn (all required) "
+                             "and --local_port (optional) to the dongle, then exit; replug the dongle to apply")
+    common.add_argument("--ip", type=str, default='', metavar='IP',
+                        help="Required with --ntn_config: UDP server (remote) IP address (reg 0xC3CA)")
+    common.add_argument("--remote_port", type=str, default='', metavar='PORT',
+                        help="Required with --ntn_config: UDP server (remote) port (reg 0xC3B8)")
+    common.add_argument("--apn", type=str, default='', metavar='APN',
+                        help="Required with --ntn_config: APN name (reg 0xC3BB)")
+    common.add_argument("--local_port", type=str, default='', metavar='PORT',
+                        help="Optional with --ntn_config: dongle (local) UDP port (reg 0xC3D5, default: 55001)")
+    # One-shot CSQ/GPS read interval
+    common.add_argument("--csq_gps_interval", type=str.lower, choices=list(CSQ_GPS_INTERVAL_VALUES) + ['get'],
+                        default=None,
+                        help="One-shot: set how often the dongle reads CSQ and GPS from the NTN module "
+                             "(holding register 0xC35B, saved to EEPROM), then exit. 'off'=disabled, "
+                             "'1'/'10'/'30'/'60'=minutes, 'default'=original ~0.9 s cycle, 'get'=read current value only")
+    nordic = parser.add_argument_group(
+        "Nordic nRF9151 modem only",
+        "Commands sent via the NTN/TN module command channel (0x9C40); replies come back on 0xF060/0xF061.")
+    # LEO setup: --leo_config + one TLE source, usually followed by --ntn_trigger sgp4
+    nordic.add_argument("--leo_config", action='store_true', default=False,
+                        help="Configure LEO target satellite (SET_TARGET_ID) and orbit (SET_TLE) from exactly "
+                             "one of --tle_file, --tle_norad, --tle_name; runs before the status loop")
+    nordic.add_argument("--tle_file", type=str, default=None, metavar='FILE',
+                        help="TLE source for --leo_config: 3-line TLE file (SATELIOT_<id> name, TLE line1, TLE line2)")
+    nordic.add_argument("--tle_norad", type=int, default=None, metavar='CATNR',
+                        help="TLE source for --leo_config: fetch name + current TLE from celestrak.org by NORAD "
+                             "catalog number (e.g. 60534 = SATELIOT_2); needs internet")
+    nordic.add_argument("--tle_name", type=str, default=None, metavar='NAME',
+                        help="TLE source for --leo_config: fetch the current TLE from celestrak.org by exact "
+                             "satellite name (e.g. SATELIOT_2); needs internet")
+    # Mode trigger
+    nordic.add_argument("--ntn_trigger", type=str, choices=['sgp4', 'gnss', 'tn', 'ntn'], default=None,
+                        help="Switch network mode: 'sgp4'=LEO tracking (after --leo_config), 'gnss'=GNSS fix, "
+                             "'tn'=terrestrial, 'ntn'=GEO satellite. Before 'ntn', trigger 'gnss' first and "
+                             "confirm the GPS location (0xEB1B/0xEB20) has updated; runs before the status loop")
+    # Status queries: --ntn_query [+ --ntn_query_once]
+    nordic.add_argument("--ntn_query", type=str.upper, nargs='+', choices=list(NTN_QUERY_FIELDS) + ['ALL'],
+                        default=None, metavar='CMD',
+                        help="Send status query command(s) (NTN_STATUS_SPEC §3, plus LEO NEXTPASS, MOBUF = "
+                             "queue depth, SIB32 = latest raw ephemeris) each status loop iteration, before "
+                             "uplink, and log the parsed replies. "
+                             f"Choices (case-insensitive): {', '.join(NTN_QUERY_FIELDS)}, ALL")
+    nordic.add_argument("--ntn_query_once", action='store_true', default=False,
+                        help="With --ntn_query: run the queries once (no device setup flow) and exit")
+    nordic.add_argument("--network_registration_status", action='store_true', default=False,
+                        help="One-shot: query network registration status (AT+CEREG?), then exit")
+    # LEO auto-MO queue: --mobuf_clear -> --mobuf -> --mocount, all run before the status loop
+    nordic.add_argument("--mobuf_clear", action='store_true', default=False,
+                        help="Clear the auto-MO queue (bare MOBUF); runs before --mobuf")
+    nordic.add_argument("--mobuf", type=str, nargs='+', default=None, metavar='TEXT',
+                        help="Append payload(s) to the auto-MO queue (MOBUF <text>, NVS-persisted, sent on "
+                             "each LEO pass); runs before the status loop / --ntn_query_once")
+    nordic.add_argument("--mocount", type=int, default=None, metavar='N',
+                        help=f"Set auto-MO sends per pass (MOCOUNT <N>, 0..{MOCOUNT_MAX}, 0 = firmware default 5)")
+    lora_g = parser.add_argument_group(
+        "LoRa (A2 hardware)",
+        "LoRa module config and key provisioning; settings and keys are read from lora.ini.\n"
+        "Setup/cleanup/query commands run before the status loop.")
+    lora_g.add_argument("--lora_setup", action='store_true', default=False,
+                        help="Write LoRa module config (frequency, SF, channel plan) from lora.ini [LORA]")
+    lora_g.add_argument("--lora", action='store_true', default=False,
+                        help="Poll LoRa data each status loop iteration")
+    lora_g.add_argument("--lora_node_query", action='store_true', default=False,
+                        help="Read all 16 LoRa node key slots (private keys + OTAA EUI)")
+    lora_g.add_argument("--lora_node_setup", action='store_true', default=False,
+                        help="Write LoRa node keys (private keys + OTAA EUI) from lora.ini [PRIVATE_KEY]")
+    lora_g.add_argument("--lora_node_cleanup", action='store_true', default=False,
+                        help="Wipe all 16 LoRa node key slots (private keys + OTAA EUI)")
+    lora_g.add_argument("--lora_pubkey_setup", action='store_true', default=False,
+                        help="Write LoRa public key from lora.ini [PUBLIC_KEY]")
+    lora_g.add_argument("--lora_pubkey_cleanup", action='store_true', default=False,
+                        help="Wipe LoRa public key")
     return parser.parse_args()
 
 # === Logger Setup ===
@@ -399,33 +498,64 @@ SATELIOT_NAME_RE = re.compile(r'^SATELIOT_(\d+)$', re.IGNORECASE)
 
 
 def parse_tle_file(path):
-    """Parse a 3-line TLE file (name, line1, line2) for --leo_config.
-    Target ID is parsed from the name; only 'SATELIOT_<id>' is supported."""
+    """Parse a 3-line TLE file (name, line1, line2) for --leo_config."""
     with open(path, encoding='ascii', errors='replace') as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
+        return parse_tle_lines([ln.strip() for ln in f if ln.strip()])
+
+
+CELESTRAK_TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?{}={}&FORMAT=TLE'
+
+
+def fetch_tle_celestrak(catnr=None, name=None, timeout_s=15):
+    """Fetch a satellite's 3-line TLE (name, line1, line2) from CelesTrak by NORAD catalog number or exact name.
+    Unknown CATNR/NAME raises urllib HTTPError 404 (an OSError)."""
+    url = CELESTRAK_TLE_URL.format(*(('CATNR', catnr) if catnr is not None else
+                                     ('NAME', urllib.parse.quote(name))))
+    with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+        text = resp.read().decode('ascii', errors='replace')
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if name is not None:
+        # NAME= is a substring search (SATELIOT_1 would also match SATELIOT_10): keep the exact-name entry
+        sets = [lines[i:i + 3] for i in range(0, len(lines) - 2, 3)]
+        lines = next((st for st in sets if st[0].upper() == name.upper()), [])
+        if not lines:
+            raise ValueError(f'No satellite named {name!r} at {url}; found: {[st[0] for st in sets]}')
+    if len(lines) < 3:
+        raise ValueError(f'No TLE found at {url}: {text.strip()!r}')
+    tle_info = parse_tle_lines(lines)
+    if catnr is not None and int(tle_info[2][2:7]) != catnr:
+        raise ValueError(f'{url}: TLE is for catalog number {tle_info[2][2:7]}, not {catnr}')
+    return tle_info
+
+
+def parse_tle_lines(lines):
+    """Validate [name, line1, line2]; return (target_id, name, line1, line2).
+    Target ID is parsed from the name; only 'SATELIOT_<id>' is supported."""
     if len(lines) < 3:
         raise ValueError(f'TLE file requires at least 3 lines (name + line1 + line2), got {len(lines)}')
     name, line1, line2 = lines[0], lines[1], lines[2]
+    if not (line1.startswith('1 ') and line2.startswith('2 ') and len(line1) == len(line2) == 69):
+        raise ValueError(f'Invalid TLE lines (expected two 69-char lines starting "1 "/"2 "): {line1!r} {line2!r}')
     m = SATELIOT_NAME_RE.match(name)
     if not m:
         raise ValueError(f"Unsupported satellite name '{name}': only 'SATELIOT_<id>' is currently supported")
     return int(m.group(1)), name, line1, line2
 
 
-def _ntn_cmd_unlock(ntn_dongle):
-    """Write the default password (Sequence 1 unlock), matching ntn_config()/ntn_info()."""
+def ntn_unlock(ntn_dongle):
+    """Write the default password (Sequence 1 unlock) to 0x0000. main() calls this once, before any other register access."""
     DEFAULT_PASSWD = '00000000'
     passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
+    logger.info(f'password: {passwd}')
     if not ntn_dongle.set_registers(0x0000, passwd):
         logger.error('Password set failed')
         return False
+    logger.info('Password set successfully')
     return True
 
 
 def network_registration_status(ntn_dongle):
     """One-shot: AT+CEREG? via the NTN/TN module command channel (0x9C40), log the reply."""
-    if not _ntn_cmd_unlock(ntn_dongle):
-        return
     if not ntn_dongle.ntn_cmd('AT+CEREG?'):
         logger.error('AT+CEREG? command failed')
         return
@@ -433,31 +563,31 @@ def network_registration_status(ntn_dongle):
     logger.info(f'Network registration status: {reply}')
 
 
-def leo_config(ntn_dongle, tle_file):
-    """Parse --tle_file, then SET_TARGET_ID + SET_TLE over the 0x9C40 command channel."""
+def leo_config(ntn_dongle, tle_file=None, tle_norad=None, tle_name=None):
+    """Parse --tle_file (or fetch --tle_norad/--tle_name from CelesTrak), then SET_TARGET_ID + SET_TLE over the 0x9C40 command channel."""
     try:
-        target_id, name, line1, line2 = parse_tle_file(tle_file)
+        if tle_norad is not None or tle_name:
+            target_id, name, line1, line2 = fetch_tle_celestrak(tle_norad, tle_name)
+        else:
+            target_id, name, line1, line2 = parse_tle_file(tle_file)
     except (OSError, ValueError) as e:
         logger.error(f'--leo_config failed: {e}')
-        return
-    if not _ntn_cmd_unlock(ntn_dongle):
         return
     if not ntn_dongle.ntn_cmd(f'SET_TARGET_ID {target_id}'):
         logger.error('SET_TARGET_ID failed')
         return
     logger.info(f'SET_TARGET_ID {target_id} sent')
-    if not ntn_dongle.ntn_cmd(f'SET_TLE "{name}" "{line1}" "{line2}"'):
+    set_tle = f'SET_TLE "{name}" "{line1}" "{line2}"'
+    if not ntn_dongle.ntn_cmd(set_tle):
         logger.error('SET_TLE failed')
         return
-    logger.info(f'SET_TLE "{name}" sent')
+    logger.info(f'{set_tle} sent')
 
 
 def ntn_trigger(ntn_dongle, which):
     """Trigger LEO(sgp4) / GNSS / TN / GEO(ntn) mode via the 0x9C40 command channel."""
     cmd_map = {'sgp4': 'SGP4_TRIGGER', 'gnss': 'GNSS_TRIGGER', 'tn': 'TN_TRIGGER', 'ntn': 'NTN_TRIGGER'}
     cmd = cmd_map[which]
-    if not _ntn_cmd_unlock(ntn_dongle):
-        return
     if ntn_dongle.ntn_cmd(cmd):
         logger.info(f'{cmd} sent')
     else:
@@ -475,6 +605,8 @@ def parse_ntn_query_reply(cmd, reply):
     body = m.group(1)
     if body == 'NONE':
         return 'NONE'
+    if NTN_QUERY_FIELDS[cmd] is None:
+        return {'raw': body}
     values = next(csv.reader([body], skipinitialspace=True))
     fields = NTN_QUERY_FIELDS[cmd]
     if len(values) != len(fields):
@@ -494,10 +626,8 @@ def ntn_query(ntn_dongle, cmds):
     Called once from main() with --ntn_query_once, else from ntn_status_loop() before uplink, since replies share 0xF060/0xF061 with the uplink ACK."""
     if 'ALL' in cmds:
         cmds = list(NTN_QUERY_FIELDS)
-    if not _ntn_cmd_unlock(ntn_dongle):
-        return
     for cmd in dict.fromkeys(cmds):
-        if not ntn_dongle.ntn_cmd(cmd):
+        if not ntn_dongle.ntn_cmd(NTN_QUERY_WIRE_CMD.get(cmd, cmd)):
             logger.error(f'{cmd} command failed')
             continue
         reply = ntn_cmd_reply(ntn_dongle)
@@ -509,16 +639,46 @@ def ntn_query(ntn_dongle, cmds):
             logger.info(f'{cmd}: {parsed}')
 
 
-def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str = None):
-    """One-shot: authenticate then write UDP network parameters to device registers."""
-    DEFAULT_PASSWD = '00000000'
-    passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
-    logger.info(f'password: {passwd}')
-    if not ntn_dongle.set_registers(0x0000, passwd):
-        logger.error('Password set failed')
-        sys.exit(1)
-    logger.info('Password set successfully')
+def ntn_send_cmd(ntn_dongle, cmd):
+    """Send one 0x9C40 command and log its reply (read so it doesn't linger on 0xF060/0xF061)."""
+    if not ntn_dongle.ntn_cmd(cmd):
+        logger.error(f'{cmd} command failed')
+        return False
+    reply = ntn_cmd_reply(ntn_dongle)
+    logger.info(f'{cmd} reply: {reply!r}')
+    if reply is None or 'ERROR' in reply:
+        logger.error(f'{cmd}: no valid reply')
+        return False
+    return True
 
+
+def mo_queue_config(ntn_dongle, clear, texts, count):
+    """--mobuf_clear / --mobuf / --mocount: auto-MO queue and per-pass send count via 0x9C40."""
+    if clear:
+        ntn_send_cmd(ntn_dongle, 'MOBUF')
+    for text in texts or []:
+        ntn_send_cmd(ntn_dongle, f'MOBUF {text}')
+    if count is not None:
+        ntn_send_cmd(ntn_dongle, f'MOCOUNT {count}')
+
+
+def csq_gps_interval(ntn_dongle, choice):
+    """One-shot: write the CSQ/GPS read interval to 0xC35B (unless choice is 'get'), then read it back."""
+    if choice != 'get':
+        value = CSQ_GPS_INTERVAL_VALUES[choice]
+        if not ntn_dongle.set_register(CSQ_GPS_INTERVAL_REG, value):
+            logger.error(f'Failed to set CSQ/GPS interval to 0x{value:02X} (exception 0x03 = value not supported)')
+            return False
+    value = ntn_dongle.read_register(CSQ_GPS_INTERVAL_REG, functioncode=cst.READ_HOLDING_REGISTERS)
+    if value is None:
+        logger.error('Failed to read CSQ/GPS interval')
+        return False
+    logger.info(f'CSQ/GPS interval: 0x{value:02X} ({CSQ_GPS_INTERVAL_DESC.get(value, "unknown")})')
+    return True
+
+
+def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str = None):
+    """One-shot: write UDP network parameters to device registers (main() has already unlocked)."""
     sn = ntn_dongle.read_registers(0xEA60, 6)
     if not sn:
         logger.error('SN read failed')
@@ -539,15 +699,7 @@ def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str 
 
 
 def ntn_info(ntn_dongle, args):
-    """Authenticate, log UDP config registers (UDP mode only), then log device info and NTN metrics."""
-    DEFAULT_PASSWD = '00000000'
-    passwd = [int(DEFAULT_PASSWD[i:i+2]) for i in range(0, len(DEFAULT_PASSWD), 2)]
-    logger.info(f'password: {passwd}')
-    if not ntn_dongle.set_registers(0x0000, passwd):
-        logger.error('Password set failed')
-        sys.exit(1)
-    logger.info('Password set successfully')
-
+    """Log UDP config registers (UDP mode only), then device info and NTN metrics (main() has already unlocked)."""
     def log_reg(desc, resp):
         if resp:
             logger.info(f'{desc}: {ntn_modbus_master.modbus_data_to_string(resp)}')
@@ -926,22 +1078,39 @@ def main():
     lora_conf = LoraConfig()
     try:
         ntn_dongle = ntn_modbus_master(NTN_DONGLE_ADDR, port=args.port, baudrate=115200)
+        # Unlock first: every command/register access below needs the password set
+        if not ntn_unlock(ntn_dongle):
+            sys.exit(1)
         if args.dl:
             dl_thread = threading.Thread(target=dl_read, args=(ntn_dongle,), daemon=True)
             dl_thread.start()
         # One-shot UDP device config mode
         if args.ntn_config:
-            if not all([args.remote_port, args.apn, args.ip]):
-                logger.error('Please provide --remote_port, --apn, and --ip for configuration.')
+            missing = [opt for opt, val in (('--remote_port', args.remote_port), ('--apn', args.apn),
+                                            ('--ip', args.ip)) if not val]
+            if missing:
+                logger.error(f'--ntn_config also needs: {", ".join(missing)} '
+                             '(e.g. --ntn_config --ip 203.0.113.10 --remote_port 5000 --apn internet)')
                 sys.exit(1)
             ntn_config(ntn_dongle, args.remote_port, args.apn, args.ip, args.local_port)
             logger.info('NTN dongle configured successfully.')
             logger.info('Please unplug the NTN dongle and plug it back in to apply new settings.')
             return
+        # One-shot CSQ/GPS read interval config (0xC35B)
+        if args.csq_gps_interval:
+            if not csq_gps_interval(ntn_dongle, args.csq_gps_interval):
+                sys.exit(1)
+            return
         # One-shot network registration status query (AT+CEREG? via 0x9C40)
         if args.network_registration_status:
             network_registration_status(ntn_dongle)
             return
+        # Auto-MO queue / send count (0x9C40, nRF9151 firmware); before --ntn_query_once so it can verify
+        if args.mobuf_clear or args.mobuf or args.mocount is not None:
+            if args.mocount is not None and not 0 <= args.mocount <= MOCOUNT_MAX:
+                logger.error(f'--mocount must be 0..{MOCOUNT_MAX}.')
+                sys.exit(1)
+            mo_queue_config(ntn_dongle, args.mobuf_clear, args.mobuf, args.mocount)
         # One-shot nRF9151 status query (--ntn_query --ntn_query_once)
         if args.ntn_query_once:
             if not args.ntn_query:
@@ -958,10 +1127,10 @@ def main():
             lora_node_query(ntn_dongle)
         # LEO target/orbit config and network mode trigger (0x9C40, nRF9151 firmware)
         if args.leo_config:
-            if not args.tle_file:
-                logger.error('Please provide --tle_file for --leo_config.')
+            if sum([bool(args.tle_file), args.tle_norad is not None, bool(args.tle_name)]) != 1:
+                logger.error('Please provide exactly one of --tle_file, --tle_norad, --tle_name for --leo_config.')
                 sys.exit(1)
-            leo_config(ntn_dongle, args.tle_file)
+            leo_config(ntn_dongle, args.tle_file, args.tle_norad, args.tle_name)
         if args.ntn_trigger:
             ntn_trigger(ntn_dongle, args.ntn_trigger)
         ntn_status_loop(ntn_dongle, args, lora_conf)
