@@ -870,8 +870,22 @@ def lora_node_query(ntn_dongle):
             logger.warning(f'Skipping OTAA query for slot {i}: FW {version} < V1.3.0')
 
 
+def read_signal_gnss(ntn_dongle):
+    """Read RSRP (0xEB15), SINR (0xEB13), latitude (0xEB1B) and longitude (0xEB20) as strings ('' if unavailable)."""
+    def read_str(reg, num):
+        resp = ntn_dongle.read_registers(reg, num)
+        return ntn_modbus_master.modbus_data_to_string(resp) if resp else ''
+
+    return {
+        'rsrp': read_str(0xEB15, 2),
+        'sinr': read_str(0xEB13, 2),
+        'lat': read_str(0xEB1B, 5),
+        'lon': read_str(0xEB20, 6),
+    }
+
+
 def ntn_status_loop(ntn_dongle, args, lora_conf):
-    """Main status loop: poll NTN status, run --ntn_query, upload telemetry, poll LoRa, then sleep --interval seconds.
+    """Main status loop: poll NTN status, log signal/GNSS, run --ntn_query, upload telemetry, poll LoRa, then sleep --interval seconds.
     The interval is wall-clock based: sleep time = interval - elapsed work time."""
     while True:
         t_start = time()
@@ -883,7 +897,7 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                 downlink_ready = (ntn_status & 0x02) >> 1
                 sim_ready = (ntn_status & 0x04) >> 2
                 network_registered = (ntn_status & 0x08) >> 3
-                logger.info('=== NTN dongle status ===')
+                logger.info('=== Network Connection Status ===')
                 logger.info(f'{module_at_ready=}')
                 logger.info(f'{downlink_ready=}')
                 logger.info(f'{sim_ready=}')
@@ -896,7 +910,7 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                 sim_ready = (ntn_status & 0x04) >> 2
                 network_registered = (ntn_status & 0x08) >> 3
                 socket_ready = (ntn_status & 0x10) >> 4
-                logger.info('=== NTN dongle status ===')
+                logger.info('=== Network Connection Status ===')
                 logger.info(f'{module_at_ready=}')
                 logger.info(f'{ip_ready=}')
                 logger.info(f'{sim_ready=}')
@@ -907,14 +921,23 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
             else:
                 logger.error(f'Wrong NTN type: {args.type}')
 
+        avbl = ntn_dongle.read_register(0xEA7D)
+        #logger.info(f'{avbl=}')
+        upload_avbl = ntn_dongle.read_register(0xEA7D) == 0
+        logger.info('=== Ready to Upload ===')
+        logger.info(f'Upload Available: {upload_avbl}')
+
+        sig_gnss = read_signal_gnss(ntn_dongle)
+        logger.info('=== Signal Strength / GNSS ===')
+        logger.info(f"RSRP: {sig_gnss['rsrp']}")
+        logger.info(f"SINR: {sig_gnss['sinr']}")
+        logger.info(f"Latitude: {sig_gnss['lat']}")
+        logger.info(f"Longitude: {sig_gnss['lon']}")
+
         # nRF9151 status queries (0x9C40); must finish before uplink, which reuses 0xF060/0xF061
         if args.ntn_query:
             logger.info('=== nRF9151 status query ===')
             ntn_query(ntn_dongle, args.ntn_query)
-
-        avbl = ntn_dongle.read_register(0xEA7D)
-        logger.info(f'{avbl=}')
-        upload_avbl = ntn_dongle.read_register(0xEA7D) == 0
 
         do_upload = args.upload or (args.ud_data is not None) or args.ud_fill
         if net_status and upload_avbl:
@@ -961,37 +984,12 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                     is_raw = False
 
                     if args.ud_type in ('signal', 'all'):
-                        signal_list = []
-                        rsrp_resp = ntn_dongle.read_registers(0xEB15, 2)
-                        if rsrp_resp:
-                            logger.info(f'rsrp_resp: {rsrp_resp}')
-                            rsrp = ntn_modbus_master.modbus_data_to_string(rsrp_resp)
-                            if rsrp:
-                                logger.info(f'RSRP: {repr(rsrp)}')
-                                signal_list.append(int(rsrp))
-                        sinr_resp = ntn_dongle.read_registers(0xEB13, 2)
-                        if sinr_resp:
-                            sinr = ntn_modbus_master.modbus_data_to_string(sinr_resp)
-                            if sinr:
-                                logger.info(f'SINR: {sinr}')
-                                signal_list.append(int(sinr))
+                        signal_list = [int(sig_gnss[k]) for k in ('rsrp', 'sinr') if sig_gnss[k]]
                         if signal_list:
                             raw_packets.append({'c': signal_list})
 
                     if args.ud_type in ('gps', 'all'):
-                        gps_list = []
-                        lat_resp = ntn_dongle.read_registers(0xEB1B, 5)
-                        if lat_resp:
-                            lat = ntn_modbus_master.modbus_data_to_string(lat_resp)
-                            if lat:
-                                logger.info(f'Latitude: {lat}')
-                                gps_list.append(float(lat))
-                        long_resp = ntn_dongle.read_registers(0xEB20, 6)
-                        if long_resp:
-                            long = ntn_modbus_master.modbus_data_to_string(long_resp)
-                            if long:
-                                logger.info(f'Longitude: {long}')
-                                gps_list.append(float(long))
+                        gps_list = [float(sig_gnss[k]) for k in ('lat', 'lon') if sig_gnss[k]]
                         if gps_list:
                             raw_packets.append({'g': gps_list})
 
