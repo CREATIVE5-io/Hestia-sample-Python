@@ -13,6 +13,7 @@ Python scripts for testing and controlling NTN (Non-Terrestrial Network) modems 
 - Reads device info: Serial Number, Model Name, Firmware/Hardware versions, Modbus ID, Heartbeat
 - Retrieves NTN metrics: IMSI, SINR, RSRP, GPS Latitude/Longitude
 - Monitors NTN module status (AT ready, SIM ready, network registered, socket ready)
+- Logs upload availability, RSRP/SINR and GPS Latitude/Longitude every status loop iteration
 - Supports NIDD and UDP protocol modes
 - Configures UDP network parameters (remote IP, port, APN, local port) via `--ntn_config`
 - Optional downlink data reading in a separate thread
@@ -87,7 +88,7 @@ Each of these is a one-shot action; `--leo_config` and `--ntn_trigger` then cont
 
 **Getting TLE data:** [n2yo.com](https://www.n2yo.com/) provides up-to-date TLE data for tracked satellites — look up the target satellite there, copy its two TLE lines into `--tle_file` (line 1 must still be renamed to `SATELIOT_<id>` for `parse_tle_file()` to accept it).
 
-**NTN trigger workflow:** before triggering `ntn` (GEO), first trigger `gnss` and confirm the device has an updated GPS fix — check Latitude/Longitude (`0xEB1B`/`0xEB20`, logged at startup by `ntn_info()`, or uploaded via `--ud_type gps`) has actually changed/updated — then trigger `ntn`.
+**NTN trigger workflow:** before triggering `ntn` (GEO), first trigger `gnss` and confirm the device has an updated GPS fix — check Latitude/Longitude (`0xEB1B`/`0xEB20`, logged at startup by `ntn_info()` and every status loop iteration, or uploaded via `--ud_type gps`) has actually changed/updated — then trigger `ntn`.
 
 ### LoRa options (A2 hardware)
 
