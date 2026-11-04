@@ -64,6 +64,7 @@ python ntn_modbus_master_sample.py [options]
 | `--ud_size` | Pad upload payload to this many bytes with repeating `1234567890` fill (`0` = no padding) | `0` |
 | `--ud_fill` | Send exactly `--ud_size` bytes of repeating `1234567890`, no other data; implies `--upload` (uses `150` if `--ud_size` is `0`) | `False` |
 | `--no_ack` | Skip waiting on `0xF060`/`0xF061` after upload, for dongle firmware that never sends an uplink ACK (older firmware only — the wait loop blocks forever otherwise) | `False` |
+| `--ceresgate` | CeresGate UDP gateway format: dongle FW version must start with `E` (else exits with `'--ceresgate' not supported`) and `--type UDP`. Uplinks become `hex(IMSI + data)` (15-digit IMSI from `0xEB00`, compact JSON, warns over 256 B); downlinks are hex-decoded and repeats flagged. Register/log in at https://ceresgate.aiotxems.io for the gateway IP/port and write them with `--ntn_config` first | `False` |
 | `--dl` | Enable downlink reading in a separate thread | `False` |
 | `--interval` | Status loop interval in seconds | `600` |
 | `--log_file` | Log file path; set to `''` to disable file logging | `ntn_modbus.log` |

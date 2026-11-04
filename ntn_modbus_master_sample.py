@@ -13,6 +13,7 @@ import sys
 import threading
 import urllib.parse
 import urllib.request
+from collections import deque
 from time import sleep, time
 
 # === Third-Party Imports ===
@@ -64,6 +65,11 @@ CSQ_GPS_INTERVAL_DESC = {0: 'disabled', 1: '1 min', 2: '10 min', 3: '30 min', 4:
 NCHECK_BITS = ['module_ready', 'sim_ready', 'provider_resolved', 'gnss_fix_valid',
                'tle_valid', 'ntn_registered', 'socket_open', 'mo_queue_pending']
 
+# CeresGate UDP gateway (https://ceresgate.aiotxems.io/resources/device-connection):
+# uplink = hex(UTF-8(IMSI[15] + data)); recommended IMSI + data <= 256 bytes before hex encoding.
+CERESGATE_URL = 'https://ceresgate.aiotxems.io'
+CERESGATE_MAX_BYTES = 256
+
 # === Argument Parsing ===
 HELP_EXAMPLES = """\
 Options marked "One-shot" run and exit. All other commands (--leo_config, --ntn_trigger,
@@ -79,6 +85,8 @@ examples:
     %(prog)s --port /dev/ttyUSB0 --upload --ud_type uav --uav_data '{"mode_id":3}'
   Write UDP network params (UDP firmware only; replug the dongle afterwards):
     %(prog)s --port /dev/ttyUSB0 --ntn_config --ip 203.0.113.10 --remote_port 5000 --apn internet
+  CeresGate - after writing the gateway IP/port from the CeresGate portal with --ntn_config:
+    %(prog)s --port /dev/ttyUSB0 --ceresgate --upload --dl --interval 60
   Set the CSQ/GPS read interval to 10 min (or 'get' to read it back):
     %(prog)s --port /dev/ttyUSB0 --csq_gps_interval 10
 
@@ -138,6 +146,13 @@ def parse_arguments():
     # Downlink
     common.add_argument("--dl", action='store_true', default=False,
                         help="Read downlink data (0xEC60) in a background thread")
+    # CeresGate cloud UDP gateway
+    common.add_argument("--ceresgate", action='store_true', default=False,
+                        help="Use the CeresGate UDP gateway packet format (FW version must start with 'E', "
+                             "UDP firmware): uplinks are prefixed with the 15-digit IMSI, downlinks are "
+                             "hex-decoded and duplicates flagged. Register and log in at "
+                             f"{CERESGATE_URL} to get the gateway IP/port, and write them with "
+                             "--ntn_config first")
     # One-shot UDP device config: --ntn_config + --remote_port/--apn/--ip[/--local_port]
     common.add_argument("--ntn_config", action='store_true', default=False,
                         help="UDP firmware only. One-shot: write --ip, --remote_port, --apn (all required) "
@@ -400,9 +415,12 @@ class ntn_modbus_master:
             return None
 
 
-def dl_read(ntn_dongle):
-    """Continuously read downlink data from the device (runs in a daemon thread)."""
+def dl_read(ntn_dongle, ceresgate=False):
+    """Continuously read downlink data from the device (runs in a daemon thread).
+    With ceresgate=True, the payload is the CeresGate downlink hex string itself; it is hex-decoded and
+    repeats of recent payloads are flagged (CeresGate may deliver the same downlink more than once)."""
     MAX_REGS_PER_READ = 64  # match NTN downlink data part size (EC61–ECA0)
+    recent = deque(maxlen=20)  # CeresGate sends up to 20 downlinks per uplink
     while True:
         try:
             data_len = 0
@@ -425,6 +443,13 @@ def dl_read(ntn_dongle):
                 if not error:
                     logger.info(f'Downlink data response: {dl_resp}')
                     dl_data = b''.join(struct.pack('>H', v) for v in dl_resp)
+                    if ceresgate:
+                        dl_hex = dl_data.rstrip(b'\x00').strip().decode('ascii', errors='replace')
+                        logger.info(f'CeresGate downlink (hex): {dl_hex}')
+                        if dl_hex in recent:
+                            logger.warning('CeresGate downlink is a repeat of a recent one (duplicates are '
+                                           'expected; handle downlinks idempotently)')
+                        recent.append(dl_hex)
                     try:
                         dl_text = binascii.unhexlify(dl_data).decode('utf-8').rstrip('\x00')
                     except Exception:
@@ -698,6 +723,51 @@ def ntn_config(ntn_dongle, remote_port: str, apn: str, ip: str, local_port: str 
     write_param('Local port', 0xC3D5, local_port if local_port else '55001')
 
 
+def read_reg_str(ntn_dongle, reg, num):
+    """Read num input registers as a string with NUL padding and whitespace stripped ('' on failure)."""
+    resp = ntn_dongle.read_registers(reg, num)
+    s = ntn_modbus_master.modbus_data_to_string(resp) if resp else None
+    return s.replace('\x00', '').strip() if s else ''
+
+
+def ceresgate_check(ntn_dongle, args):
+    """--ceresgate pre-checks: dongle FW version (0xEA6B) must start with 'E', and --type must be UDP.
+    Logs the CeresGate registration notice. Returns False if --ceresgate is not supported."""
+    fw_ver = read_reg_str(ntn_dongle, 0xEA6B, 2)
+    logger.info(f'FW ver: {fw_ver!r}')
+    if not fw_ver.startswith('E'):
+        logger.error(f"'--ceresgate' not supported (FW version {fw_ver!r} does not start with 'E')")
+        return False
+    if args.type != 'UDP':
+        logger.error("'--ceresgate' needs UDP firmware (--type UDP); the CeresGate gateway is UDP only")
+        return False
+    logger.info('=== CeresGate NOTICE ===')
+    logger.info(f'Register and log in at {CERESGATE_URL} to get the CeresGate UDP Gateway IP and port,')
+    logger.info('then write them to the dongle with --ntn_config first, e.g.:')
+    logger.info('  --ntn_config --ip <GATEWAY_IP> --remote_port <GATEWAY_PORT> --apn <APN>')
+    logger.info("Also bind this dongle's IMSI in the portal; data from an unbound IMSI is not forwarded.")
+    logger.info('========================')
+    return True
+
+
+def ceresgate_read_imsi(ntn_dongle):
+    """Read the IMSI (0xEB00) for the CeresGate uplink prefix; returns the 15-digit string or None."""
+    imsi = read_reg_str(ntn_dongle, 0xEB00, 8)
+    if len(imsi) != 15 or not imsi.isdigit():
+        logger.error(f'CeresGate: IMSI {imsi!r} is not 15 digits; uplink skipped')
+        return None
+    return imsi
+
+
+def ceresgate_wrap(imsi, d_bytes):
+    """Prefix the CeresGate IMSI to the uplink data (the caller hex-encodes the result)."""
+    packet = imsi.encode('ascii') + d_bytes
+    if len(packet) > CERESGATE_MAX_BYTES:
+        logger.warning(f'CeresGate: IMSI + data is {len(packet)}B, over the recommended '
+                       f'{CERESGATE_MAX_BYTES}B; it may be truncated')
+    return packet
+
+
 def ntn_info(ntn_dongle, args):
     """Log UDP config registers (UDP mode only), then device info and NTN metrics (main() has already unlocked)."""
     def log_reg(desc, resp):
@@ -940,13 +1010,17 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
             ntn_query(ntn_dongle, args.ntn_query)
 
         do_upload = args.upload or (args.ud_data is not None) or args.ud_fill
+        # CeresGate: every uplink is prefixed with the IMSI; skip the uplink if it can't be read
+        imsi = ceresgate_read_imsi(ntn_dongle) if (args.ceresgate and do_upload) else None
         if net_status and upload_avbl:
-            if do_upload:
+            if do_upload and not (args.ceresgate and imsi is None):
                 if args.ud_fill:
                     # Fill path: send exactly ud_size bytes of repeating '1234567890'
                     fill = b'1234567890'
                     size = args.ud_size if args.ud_size > 0 else 150
                     d_bytes = (fill * (size // len(fill) + 1))[:size]
+                    if args.ceresgate:
+                        d_bytes = ceresgate_wrap(imsi, d_bytes)
                     logger.info(f'd_bytes ({len(d_bytes)}B): {d_bytes}')
                     d_hex = binascii.hexlify(d_bytes)
                     logger.info(f'packet: {d_hex}')
@@ -1012,7 +1086,8 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                         if is_raw:
                             d_bytes = data.encode('utf-8')
                         else:
-                            d_str = json.dumps(data)
+                            # CeresGate: compact JSON to stay within its recommended packet size
+                            d_str = json.dumps(data, separators=(',', ':')) if args.ceresgate else json.dumps(data)
                             logger.info(f'd_str: {d_str}')
                             d_bytes = d_str.encode('utf-8')
                         if args.ud_size > 0:
@@ -1022,6 +1097,8 @@ def ntn_status_loop(ntn_dongle, args, lora_conf):
                                 d_bytes = d_bytes + (fill * (needed // len(fill) + 1))[:needed]
                             elif len(d_bytes) > args.ud_size:
                                 logger.warning(f'Upload data ({len(d_bytes)}B) exceeds --ud_size {args.ud_size}B')
+                        if args.ceresgate:
+                            d_bytes = ceresgate_wrap(imsi, d_bytes)
                         logger.info(f'd_bytes ({len(d_bytes)}B): {d_bytes}')
                         d_hex = binascii.hexlify(d_bytes)
                         logger.info(f'packet: {d_hex}')
@@ -1079,8 +1156,11 @@ def main():
         # Unlock first: every command/register access below needs the password set
         if not ntn_unlock(ntn_dongle):
             sys.exit(1)
+        # CeresGate: FW version gate + registration notice, before anything else runs
+        if args.ceresgate and not ceresgate_check(ntn_dongle, args):
+            sys.exit(1)
         if args.dl:
-            dl_thread = threading.Thread(target=dl_read, args=(ntn_dongle,), daemon=True)
+            dl_thread = threading.Thread(target=dl_read, args=(ntn_dongle, args.ceresgate), daemon=True)
             dl_thread.start()
         # One-shot UDP device config mode
         if args.ntn_config:
