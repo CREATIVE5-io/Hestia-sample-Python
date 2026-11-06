@@ -88,11 +88,12 @@ Used with `--ntn_config` to write network parameters to the device (one-shot, ex
 
 > **Nordic nRF9151 modem only.** All options in this section talk to the `0x9C40` module command channel introduced by the Nordic nRF9151 modem firmware; they are not supported on other dongle modems. Replies come back on `0xF060`/`0xF061` (shared with the uplink ACK).
 
-`--network_registration_status` and `--ntn_query ... --ntn_query_once` run and exit. `--leo_config`, `--ntn_trigger`, `--mobuf_clear`, `--mobuf` and `--mocount` run once and then continue into the normal status loop (or into `--ntn_query_once`, so the queue can be verified in the same run).
+`--network_registration_status`, `--plmn` and `--ntn_query ... --ntn_query_once` run and exit. `--leo_config`, `--ntn_trigger`, `--mobuf_clear`, `--mobuf` and `--mocount` run once and then continue into the normal status loop (or into `--ntn_query_once`, so the queue can be verified in the same run).
 
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--network_registration_status` | Query network registration status (`AT+CEREG?`), log the reply, then exit | `False` |
+| `--plmn` | GEO firmware: set the manual NTN PLMN (`AT+ESOPLMN=<MCCMNC>`, 5–6 digits, NVS-persisted, applied on the next NTN entry), `auto` to clear it, or `get` to only query; then reads back `AT+ESOPLMN?` (override/effective PLMN) and exits | `None` |
 | `--leo_config` | Configure LEO target satellite (`SET_TARGET_ID`) and orbit (`SET_TLE`); requires exactly one of `--tle_file`, `--tle_norad`, `--tle_name` | `False` |
 | `--tle_file` | 3-line TLE file for `--leo_config`: line 1 is the satellite name (only `SATELIOT_<id>` is supported; the target ID is parsed from it), lines 2–3 are the TLE | `None` |
 | `--tle_norad` | Fetch the name + current TLE from [CelesTrak](https://celestrak.org/) by NORAD catalog number (e.g. `60534` = `SATELIOT_2`); needs internet | `None` |
@@ -195,6 +196,11 @@ python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --log_file ''
 
 # Query network registration status (Nordic nRF9151 modem only)
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --network_registration_status
+
+# Set / clear / query the manual NTN PLMN (GEO firmware, AT+ESOPLMN)
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --plmn 46692
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --plmn auto
+python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --plmn get
 
 # Set the CSQ/GPS read interval to 10 min, or read the current value back
 python ntn_modbus_master_sample.py --port /dev/ttyUSB0 --csq_gps_interval 10

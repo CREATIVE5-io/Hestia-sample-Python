@@ -202,6 +202,10 @@ def parse_arguments():
                         help="With --ntn_query: run the queries once (no device setup flow) and exit")
     nordic.add_argument("--network_registration_status", action='store_true', default=False,
                         help="One-shot: query network registration status (AT+CEREG?), then exit")
+    nordic.add_argument("--plmn", type=str, default=None, metavar='MCCMNC|auto|get',
+                        help="One-shot (GEO fw): set the manual NTN PLMN (AT+ESOPLMN=<5-6 digits>, NVS-persisted, "
+                             "applied on next NTN entry), 'auto' to clear it, or 'get' to only query "
+                             "(AT+ESOPLMN?); logs override/effective PLMN, then exit")
     # LEO auto-MO queue: --mobuf_clear -> --mobuf -> --mocount, all run before the status loop
     nordic.add_argument("--mobuf_clear", action='store_true', default=False,
                         help="Clear the auto-MO queue (bare MOBUF); runs before --mobuf")
@@ -586,6 +590,33 @@ def network_registration_status(ntn_dongle):
         return
     reply = ntn_cmd_reply(ntn_dongle)
     logger.info(f'Network registration status: {reply}')
+
+
+ESOPLMN_REPLY_RE = re.compile(r'\+ESOPLMN:\s*"([^"]*)"\s*,\s*"([^"]*)"')
+
+
+def plmn_config(ntn_dongle, value):
+    """One-shot --plmn: AT+ESOPLMN=<plmn>|auto (unless 'get'), then AT+ESOPLMN? and log override/effective."""
+    value = value.strip().lower()
+    if value != 'get':
+        if value in ('auto', 'reset', 'clear'):
+            value = 'auto'
+        elif not re.fullmatch(r'\d{5,6}', value):
+            logger.error(f'--plmn must be a 5-6 digit MCCMNC, auto, or get (got {value!r})')
+            return False
+        if not ntn_send_cmd(ntn_dongle, f'AT+ESOPLMN={value}'):
+            return False
+    if not ntn_dongle.ntn_cmd('AT+ESOPLMN?'):
+        logger.error('AT+ESOPLMN? command failed')
+        return False
+    reply = ntn_cmd_reply(ntn_dongle)
+    logger.info(f'AT+ESOPLMN? reply: {reply!r}')
+    m = ESOPLMN_REPLY_RE.search(reply or '')
+    if not m:
+        logger.error('AT+ESOPLMN?: no valid reply')
+        return False
+    logger.info(f'NTN PLMN: override={m.group(1) or "(none)"}, effective={m.group(2) or "(auto)"}')
+    return True
 
 
 def leo_config(ntn_dongle, tle_file=None, tle_norad=None, tle_name=None):
@@ -1182,6 +1213,11 @@ def main():
         # One-shot network registration status query (AT+CEREG? via 0x9C40)
         if args.network_registration_status:
             network_registration_status(ntn_dongle)
+            return
+        # One-shot manual NTN PLMN set/query (AT+ESOPLMN via 0x9C40, GEO firmware)
+        if args.plmn:
+            if not plmn_config(ntn_dongle, args.plmn):
+                sys.exit(1)
             return
         # Auto-MO queue / send count (0x9C40, nRF9151 firmware); before --ntn_query_once so it can verify
         if args.mobuf_clear or args.mobuf or args.mocount is not None:
